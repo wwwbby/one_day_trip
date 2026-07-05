@@ -362,6 +362,110 @@ h1 {
   gap: 10px;
 }
 
+.departure-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.departure-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px;
+  gap: 10px;
+}
+
+.departure-row input {
+  min-width: 0;
+  min-height: 46px;
+  padding: 0 12px;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  outline: 0;
+  color: #162724;
+  background: #ffffff;
+  font-weight: 800;
+}
+
+.departure-results {
+  display: grid;
+  gap: 5px;
+  max-height: 190px;
+  overflow: auto;
+  padding: 7px;
+  border: 1px solid #cddbd7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.departure-results button {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 6px;
+  color: #162724;
+  background: transparent;
+  text-align: left;
+}
+
+.departure-results button:hover {
+  background: #edf4f2;
+}
+
+.departure-results strong,
+.departure-results span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.departure-results strong {
+  font-size: 13px;
+}
+
+.departure-results span {
+  color: #687976;
+  font-size: 12px;
+}
+
+.departure-current {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 34px;
+  gap: 8px;
+  align-items: center;
+  padding: 9px;
+  border: 1px solid #cddbd7;
+  border-radius: 8px;
+  background: #eef7f5;
+}
+
+.departure-current > svg {
+  color: #167c80;
+}
+
+.departure-current div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.departure-current strong,
+.departure-current span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.departure-current strong {
+  color: #152b27;
+  font-size: 13px;
+}
+
+.departure-current span {
+  color: #526662;
+  font-size: 12px;
+}
+
 .time-preference-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1224,6 +1328,10 @@ h1 {
     0 0 0 5px rgba(22, 124, 128, 0.24);
 }
 
+.stop-marker.is-departure {
+  background: #167c80;
+}
+
 .stop-marker.has-preview {
   box-shadow:
     0 8px 20px rgba(39, 31, 27, 0.28),
@@ -1386,6 +1494,11 @@ h1 {
 
   .date-time-grid {
     grid-template-columns: minmax(0, 1fr) 124px;
+    gap: 8px;
+  }
+
+  .departure-row {
+    grid-template-columns: 1fr;
     gap: 8px;
   }
 

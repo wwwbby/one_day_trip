@@ -140,6 +140,7 @@ function normalizeStoredPlan(value, idOverride) {
     name: cleanText(value?.name, `${tripDate} 一日规划`, 180),
     tripDate,
     startTime: typeof value?.startTime === "string" && /^\d{2}:\d{2}$/.test(value.startTime) ? value.startTime : "09:00",
+    departureStop: normalizeStoredStop(value?.departureStop),
     transitTimePreference: value?.transitTimePreference === "arrival" ? "arrival" : "departure",
     stops,
     routePlan,
@@ -987,6 +988,22 @@ app.put("/api/plans/:id", async (req, res) => {
   } catch (error) {
     return res.status(error.status || 500).json({
       error: error instanceof Error ? error.message : "Failed to save plan."
+    });
+  }
+});
+
+app.delete("/api/plans", async (req, res) => {
+  try {
+    const id = String(req.query.id || req.body?.id || "").trim();
+    if (!id) {
+      return res.status(400).json({ error: "Plan id is required." });
+    }
+    await deleteStoredPlan(id);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("[plans] delete failed", error);
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Failed to delete plan."
     });
   }
 });

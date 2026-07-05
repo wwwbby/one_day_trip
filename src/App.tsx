@@ -97,6 +97,7 @@ type DayPlan = {
   name: string;
   tripDate: string;
   startTime: string;
+  departureStop?: Stop | null;
   transitTimePreference: TransitTimePreference;
   stops: Stop[];
   routePlan: RoutePlan | null;
@@ -269,6 +270,7 @@ function createDayPlan(input: Partial<DayPlan> = {}): DayPlan {
     name: input.name?.trim() || defaultPlanName(tripDate),
     tripDate,
     startTime: input.startTime || "09:00",
+    departureStop: input.departureStop ? clonePlain(input.departureStop) : null,
     transitTimePreference: input.transitTimePreference || "departure",
     stops: clonePlain(input.stops || []),
     routePlan: clonePlain(input.routePlan || null),
@@ -280,11 +282,13 @@ function createDayPlan(input: Partial<DayPlan> = {}): DayPlan {
 function defaultDayPlans() {
   const firstDate = sampleDateForDay(18);
   const secondDate = sampleDateForDay(19);
+  const sampleStops = initialStops();
   return [
     createDayPlan({
       name: `${formatPlanDate(firstDate)} 京都巡礼`,
       tripDate: firstDate,
-      stops: initialStops()
+      departureStop: sampleStops[0],
+      stops: sampleStops.slice(1)
     }),
     createDayPlan({
       name: `${formatPlanDate(secondDate)} 一日规划`,
@@ -324,6 +328,7 @@ function normalizeDayPlan(value: any): DayPlan | null {
     name: typeof value.name === "string" && value.name.trim() ? value.name.trim() : defaultPlanName(tripDate),
     tripDate,
     startTime: typeof value.startTime === "string" && value.startTime ? value.startTime : "09:00",
+    departureStop: normalizeStop(value.departureStop),
     transitTimePreference: value.transitTimePreference === "arrival" ? "arrival" : "departure",
     stops,
     routePlan,
@@ -349,43 +354,41 @@ function loadLocalCachedPlans() {
 
 async function readPlansFromServer() {
   const response = await fetch("/api/plans");
-  if (!response.ok) {
-    throw new Error(await readApiError(response, "服务端规划读取失败。"));
-  }
-  const data = await response.json();
+  const data = await readApiJson(response, "服务端规划读取失败。");
   return Array.isArray(data?.plans)
     ? (data.plans.map(normalizeDayPlan).filter(Boolean) as DayPlan[])
     : [];
 }
 
-async function readApiError(response: Response, fallback: string) {
+async function readApiJson(response: Response, fallback: string) {
   const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
-  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  let data: any = {};
 
-  try {
-    if (contentType.includes("application/json")) {
-      const data = await response.json();
-      const message = typeof data?.error === "string" ? data.error : "";
-      return message ? `${fallback}（${status}：${message}）` : `${fallback}（${status}）`;
+  if (text.trim()) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      const excerpt = text.replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new Error(excerpt ? `${fallback}（${status}：返回内容不是 JSON：${excerpt}）` : `${fallback}（${status}：返回内容不是 JSON）`);
     }
-
-    const text = (await response.text()).replace(/\s+/g, " ").trim().slice(0, 160);
-    return text ? `${fallback}（${status}：${text}）` : `${fallback}（${status}）`;
-  } catch {
-    return `${fallback}（${status}）`;
   }
+
+  if (!response.ok) {
+    const message = typeof data?.error === "string" ? data.error : "";
+    throw new Error(message ? `${fallback}（${status}：${message}）` : `${fallback}（${status}）`);
+  }
+
+  return data;
 }
 
 async function writePlanToServer(plan: DayPlan) {
-  const response = await fetch(`/api/plans/${encodeURIComponent(plan.id)}`, {
-    method: "PUT",
+  const response = await fetch("/api/plans", {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ plan })
   });
-  if (!response.ok) {
-    throw new Error(await readApiError(response, "规划保存到服务端失败。"));
-  }
-  const data = await response.json();
+  const data = await readApiJson(response, "规划保存到服务端失败。");
   return normalizeDayPlan(data?.plan) || plan;
 }
 
@@ -395,20 +398,15 @@ async function createPlanOnServer(plan: DayPlan) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ plan })
   });
-  if (!response.ok) {
-    throw new Error(await readApiError(response, "规划创建到服务端失败。"));
-  }
-  const data = await response.json();
+  const data = await readApiJson(response, "规划创建到服务端失败。");
   return normalizeDayPlan(data?.plan) || plan;
 }
 
 async function deletePlanFromServer(id: string) {
-  const response = await fetch(`/api/plans/${encodeURIComponent(id)}`, {
+  const response = await fetch(`/api/plans?id=${encodeURIComponent(id)}`, {
     method: "DELETE"
   });
-  if (!response.ok) {
-    throw new Error(await readApiError(response, "服务端规划删除失败。"));
-  }
+  await readApiJson(response, "服务端规划删除失败。");
 }
 
 function buildLocalDateTimeIso(date: string, time: string) {
@@ -808,11 +806,13 @@ export default function App() {
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [isLoadingPlans, setIsLoadingPlans] = useState(true);
   const [planSyncMode, setPlanSyncMode] = useState<"server" | "local">("local");
+  const [departureStop, setDepartureStop] = useState<Stop | null>(null);
+  const [departureQuery, setDepartureQuery] = useState("");
+  const [departureResults, setDepartureResults] = useState<SearchResult[]>([]);
   const [stops, setStops] = useState<Stop[]>([]);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   const [tripDate, setTripDate] = useState(todayInputValue);
   const [startTime, setStartTime] = useState("09:00");
-  const [transitTimePreference, setTransitTimePreference] = useState<TransitTimePreference>("departure");
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
   const [isRouting, setIsRouting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
@@ -868,7 +868,9 @@ export default function App() {
     setPlanName(plan.name);
     setTripDate(plan.tripDate);
     setStartTime(plan.startTime);
-    setTransitTimePreference(plan.transitTimePreference);
+    setDepartureStop(clonePlain(plan.departureStop || null));
+    setDepartureQuery(plan.departureStop?.name || "");
+    setDepartureResults([]);
     setStops(clonePlain(plan.stops));
     setRoutePlan(clonePlain(plan.routePlan));
     setSelectedStopId(null);
@@ -962,7 +964,8 @@ export default function App() {
         name: planName.trim() || defaultPlanName(tripDate),
         tripDate,
         startTime,
-        transitTimePreference,
+        departureStop: clonePlain(departureStop),
+        transitTimePreference: "departure" as TransitTimePreference,
         stops: clonePlain(stops),
         routePlan: clonePlain(routePlan),
         createdAt: plansRef.current.find((plan) => plan.id === activePlanId)?.createdAt || savedAt,
@@ -989,7 +992,7 @@ export default function App() {
         }
       }
     },
-    [activePlanId, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, transitTimePreference, tripDate]
+    [activePlanId, departureStop, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, tripDate]
   );
 
   const backToPlanList = useCallback(() => {
@@ -1088,13 +1091,23 @@ export default function App() {
     setRoutePlan(null);
   }, []);
 
+  const routeStops = useMemo(
+    () => (departureStop ? [departureStop, ...stops] : stops),
+    [departureStop, stops]
+  );
+
   const schedule = useMemo<ScheduleItem[]>(() => {
     let cursor = parseClock(startTime);
     return stops.map((stop, index) => {
+      const inboundLegIndex = departureStop ? index : index - 1;
+      if (inboundLegIndex >= 0) {
+        cursor += Math.round((routePlan?.legs[inboundLegIndex]?.durationSeconds || 0) / 60);
+      }
       const arrival = cursor;
       const departure = arrival + stop.stayMinutes;
-      const travelToNextMinutes = Math.round((routePlan?.legs[index]?.durationSeconds || 0) / 60);
-      cursor = departure + travelToNextMinutes;
+      const nextLegIndex = departureStop ? index + 1 : index;
+      const travelToNextMinutes = Math.round((routePlan?.legs[nextLegIndex]?.durationSeconds || 0) / 60);
+      cursor = departure;
       return {
         stop,
         arrival,
@@ -1102,7 +1115,7 @@ export default function App() {
         travelToNextMinutes
       };
     });
-  }, [routePlan?.legs, startTime, stops]);
+  }, [departureStop, routePlan?.legs, startTime, stops]);
 
   const routeMetrics = useMemo(() => {
     const totalStay = stops.reduce((sum, stop) => sum + stop.stayMinutes, 0);
@@ -1117,9 +1130,9 @@ export default function App() {
   }, [routePlan, startTime, stops]);
 
   const routingStatusText = useMemo(() => {
-    const legCount = Math.max(0, stops.length - 1);
+    const legCount = Math.max(0, routeStops.length - 1);
     if (!legCount) return "";
-    const transitLegCount = transitCandidateLegCount(stops);
+    const transitLegCount = transitCandidateLegCount(routeStops);
     const estimateMinutes = Math.max(1, Math.ceil(transitLegCount / routeRequestQuotaPerMinute));
     if (transitLegCount > routeRequestQuotaPerMinute) {
       return `正在规划 ${legCount} 段路线，其中约 ${transitLegCount} 段需要公共交通查询。查询会按 ${routeRequestQuotaPerMinute} 次/分钟排队，预计至少 ${estimateMinutes} 分钟，请保持页面打开。`;
@@ -1128,13 +1141,18 @@ export default function App() {
       return `正在规划 ${legCount} 段短距离路线。预计主要使用步行，完成前请保持页面打开。`;
     }
     return `正在规划 ${legCount} 段路线。会优先查询 ${transitLegCount} 段 1km 以上的公共交通，完成前请保持页面打开。`;
-  }, [stops]);
+  }, [routeStops]);
 
   const selectedStopSet = useMemo(() => new Set(selectedStopIds), [selectedStopIds]);
 
   const stopBoundsKey = useMemo(
     () => stops.map((stop) => `${stop.location.lat.toFixed(6)},${stop.location.lng.toFixed(6)}`).join("|"),
     [stops]
+  );
+
+  const routeBoundsKey = useMemo(
+    () => routeStops.map((stop) => `${stop.location.lat.toFixed(6)},${stop.location.lng.toFixed(6)}`).join("|"),
+    [routeStops]
   );
 
   const projectStopToMapPoint = useCallback(
@@ -1324,7 +1342,7 @@ export default function App() {
       void saveActivePlan(false);
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [activePlanId, planName, routePlan, saveActivePlan, startTime, stops, transitTimePreference, tripDate]);
+  }, [activePlanId, departureStop, planName, routePlan, saveActivePlan, startTime, stops, tripDate]);
 
   useEffect(() => {
     if (activePlanId) return;
@@ -1465,7 +1483,23 @@ export default function App() {
         marker.map = null;
       }
 
-      googleMarkersRef.current = stops.map((stop, index) => {
+      const markers: google.maps.marker.AdvancedMarkerElement[] = [];
+      if (departureStop) {
+        const markerContent = document.createElement("button");
+        markerContent.className = "stop-marker is-departure";
+        markerContent.textContent = "出";
+        markerContent.title = departureStop.name;
+        markers.push(
+          new google.maps.marker.AdvancedMarkerElement({
+            map: googleMapRef.current,
+            position: departureStop.location,
+            title: departureStop.name,
+            content: markerContent
+          })
+        );
+      }
+
+      markers.push(...stops.map((stop, index) => {
         const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
         const markerContent = document.createElement("button");
         markerContent.className = `stop-marker ${selected ? "is-selected" : ""}`;
@@ -1502,7 +1536,8 @@ export default function App() {
         }
 
         return marker;
-      });
+      }));
+      googleMarkersRef.current = markers;
       return;
     }
 
@@ -1511,7 +1546,21 @@ export default function App() {
       marker.remove();
     }
 
-    leafletMarkersRef.current = stops.map((stop, index) => {
+    const markers: L.Marker[] = [];
+    if (departureStop) {
+      const icon = L.divIcon({
+        className: "leaflet-stop-marker",
+        html: `<button class="stop-marker is-departure">出</button>`,
+        iconSize: [31, 31],
+        iconAnchor: [15.5, 15.5]
+      });
+      markers.push(
+        L.marker([departureStop.location.lat, departureStop.location.lng], { icon })
+          .addTo(leafletMapRef.current!)
+      );
+    }
+
+    markers.push(...stops.map((stop, index) => {
       const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
       const size = selected ? 37 : 31;
       const icon = L.divIcon({
@@ -1541,24 +1590,25 @@ export default function App() {
       }
 
       return marker;
-    });
-  }, [activePlanId, mapProvider, mapReady, selectedStopId, selectedStopSet, stops]);
+    }));
+    leafletMarkersRef.current = markers;
+  }, [activePlanId, departureStop, mapProvider, mapReady, selectedStopId, selectedStopSet, stops]);
 
   useEffect(() => {
-    if (!activePlanId || !mapReady || !stops.length) return;
+    if (!activePlanId || !mapReady || !routeStops.length) return;
 
     if (mapProvider === "google") {
       if (!googleMapRef.current || !window.google?.maps) return;
       const bounds = new google.maps.LatLngBounds();
-      stops.forEach((stop) => bounds.extend(stop.location));
+      routeStops.forEach((stop) => bounds.extend(stop.location));
       googleMapRef.current.fitBounds(bounds, 80);
       return;
     }
 
     if (!leafletMapRef.current) return;
-    const bounds = L.latLngBounds(stops.map((stop) => [stop.location.lat, stop.location.lng] as L.LatLngExpression));
+    const bounds = L.latLngBounds(routeStops.map((stop) => [stop.location.lat, stop.location.lng] as L.LatLngExpression));
     leafletMapRef.current.fitBounds(bounds, { padding: [70, 70], maxZoom: 15 });
-  }, [activePlanId, mapProvider, mapReady, stopBoundsKey, stops]);
+  }, [activePlanId, mapProvider, mapReady, routeBoundsKey, routeStops]);
 
   useEffect(() => {
     if (!activePlanId || !mapReady) return;
@@ -1613,10 +1663,7 @@ export default function App() {
     setIsSearching(true);
     try {
       const response = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || "地点搜索失败。");
-      }
+      const data = await readApiJson(response, "地点搜索失败。");
       setSearchResults(data);
       if (!data.length) {
         setToast("没有找到匹配地点。");
@@ -1645,10 +1692,63 @@ export default function App() {
     [addStop]
   );
 
+  const setDepartureFromResult = useCallback((result: SearchResult) => {
+    const nextDeparture: Stop = {
+      id: `departure-${makeId()}`,
+      name: result.name,
+      address: result.address,
+      placeId: typeof result.id === "string" ? result.id : undefined,
+      location: { lat: result.lat, lng: result.lng },
+      stayMinutes: 0,
+      note: "出发点",
+      source: result.source
+    };
+    setDepartureStop(nextDeparture);
+    setDepartureQuery(result.name);
+    setDepartureResults([]);
+    setRoutePlan(null);
+  }, []);
+
+  const searchDeparturePoint = useCallback(async () => {
+    const query = departureQuery.trim();
+    const coordinates = tryParseCoordinates(query);
+    if (coordinates) {
+      setDepartureFromResult({
+        id: "coordinate",
+        name: "坐标出发点",
+        address: `${coordinates.lat.toFixed(6)}, ${coordinates.lng.toFixed(6)}`,
+        lat: coordinates.lat,
+        lng: coordinates.lng,
+        source: "coordinate"
+      });
+      return;
+    }
+
+    if (query.length < 2) {
+      setToast("请输入至少两个字的出发点。");
+      return;
+    }
+
+    setIsSearching(true);
+    try {
+      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+      const data = await readApiJson(response, "出发点搜索失败。");
+      const results = Array.isArray(data) ? data : [];
+      setDepartureResults(results);
+      if (!results.length) {
+        setToast("没有找到匹配的出发点。");
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "出发点搜索失败。");
+    } finally {
+      setIsSearching(false);
+    }
+  }, [departureQuery, setDepartureFromResult]);
+
   const calculateRoute = useCallback(
     async () => {
-      if (stops.length < 2) {
-        setToast("至少需要两个地点。");
+      if (routeStops.length < 2) {
+        setToast("请先设置出发点并添加至少一个地点。");
         return;
       }
 
@@ -1658,9 +1758,9 @@ export default function App() {
         return;
       }
       const transitLocalDateTime = `${tripDate}T${startTime}:00`;
-      const orderedStops = optimizeStopsForDay(stops);
-      const orderChanged = !isSameStopOrder(stops, orderedStops);
-      const beforeDistance = routeDistanceMeters(stops);
+      const orderedStops = optimizeStopsForDay(routeStops);
+      const orderChanged = !isSameStopOrder(routeStops, orderedStops);
+      const beforeDistance = routeDistanceMeters(routeStops);
       const afterDistance = routeDistanceMeters(orderedStops);
 
       setIsRouting(true);
@@ -1676,13 +1776,10 @@ export default function App() {
             stops: orderedStops,
             transitDateTime,
             transitLocalDateTime,
-            transitTimePreference
+            transitTimePreference: "departure"
           })
         });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data?.error || "路线计算失败。");
-        }
+        const data = await readApiJson(response, "路线计算失败。");
 
         const route = data.routes?.[0];
         if (!route) {
@@ -1690,8 +1787,14 @@ export default function App() {
         }
 
         if (orderChanged) {
-          setStops(orderedStops);
-          setSelectedStopId(orderedStops[0]?.id || null);
+          if (departureStop) {
+            setDepartureStop(orderedStops[0] || departureStop);
+            setStops(orderedStops.slice(1));
+            setSelectedStopId(orderedStops[1]?.id || null);
+          } else {
+            setStops(orderedStops);
+            setSelectedStopId(orderedStops[0]?.id || null);
+          }
           setSelectedStopIds([]);
         }
         setRoutePlan({
@@ -1743,7 +1846,7 @@ export default function App() {
         setIsRouting(false);
       }
     },
-    [startTime, stops, transitTimePreference, tripDate]
+    [departureStop, routeStops, startTime, tripDate]
   );
 
   const handleSearchEnter = useCallback(
@@ -1822,10 +1925,7 @@ export default function App() {
     setAnitabiResults([]);
     try {
       const response = await fetch(`/api/anitabi/search?q=${encodeURIComponent(query)}`);
-      if (!response.ok) {
-        throw new Error(await readApiError(response, "Anitabi 作品查找失败。"));
-      }
-      const data = await response.json();
+      const data = await readApiJson(response, "Anitabi 作品查找失败。");
       const results = Array.isArray(data?.results) ? data.results : [];
       setAnitabiResults(results);
       setToast(results.length ? `找到 ${results.length} 个可导入作品。` : "没有找到含截图点位的 Anitabi 作品。");
@@ -1846,10 +1946,7 @@ export default function App() {
     setIsImportingAnitabi(true);
     try {
       const response = await fetch(`/api/anitabi/bangumi/${subjectId}/detail`);
-      if (!response.ok) {
-        throw new Error(await readApiError(response, "Anitabi 导入失败。"));
-      }
-      const data = await response.json();
+      const data = await readApiJson(response, "Anitabi 导入失败。");
 
       const subject = data.subject || {};
       const workTitle = subject.cn || subject.title || `Bangumi ${subjectId}`;
@@ -1914,8 +2011,9 @@ export default function App() {
           mapProvider,
           tripDate,
           startTime,
-          transitTimePreference,
-          routeStrategy: "fixed-start-nearest-neighbor-2opt-transit-first",
+          departureStop,
+          transitTimePreference: "departure",
+          routeStrategy: "departure-point-nearest-neighbor-2opt-transit-first",
           stops,
           routePlan
         },
@@ -1925,14 +2023,14 @@ export default function App() {
       "application/json"
     );
     setToast("JSON 已导出。");
-  }, [mapProvider, planName, routePlan, startTime, stops, transitTimePreference, tripDate]);
+  }, [departureStop, mapProvider, planName, routePlan, startTime, stops, tripDate]);
 
   const copyGoogleMapsLink = useCallback(async () => {
-    if (stops.length < 2) {
-      setToast("至少需要两个地点。");
+    if (routeStops.length < 2) {
+      setToast("请先设置出发点并添加至少一个地点。");
       return;
     }
-    const url = buildGoogleMapsUrl(stops);
+    const url = buildGoogleMapsUrl(routeStops);
     try {
       await navigator.clipboard.writeText(url);
       setToast("路线链接已复制。");
@@ -1940,7 +2038,7 @@ export default function App() {
       downloadText("route-link.txt", url, "text/plain");
       setToast("浏览器无法复制，已导出链接文件。");
     }
-  }, [stops]);
+  }, [routeStops]);
 
   const handleDragStart = useCallback((event: DragEvent<HTMLDivElement>, id: string) => {
     setDraggingId(id);
@@ -1959,6 +2057,76 @@ export default function App() {
     },
     [draggingId, reorderStops]
   );
+
+  const renderRouteLegCard = (
+    routeLeg: RouteLeg,
+    fromStop: Stop,
+    toStop: Stop,
+    fromLabel: string,
+    toLabel: string
+  ) => {
+    const fareText = formatFare(routeLeg.fare);
+    const legSteps: RouteStep[] = routeLeg.steps?.length
+      ? routeLeg.steps
+      : [
+          {
+            mode: routeLeg.mode,
+            line: routeLeg.summary,
+            durationSeconds: routeLeg.durationSeconds,
+            distanceMeters: routeLeg.distanceMeters,
+            from: fromStop.name,
+            to: toStop.name
+          }
+        ];
+    const RouteSummaryIcon = routeLeg.mode === "WALK" ? Footprints : TrainFront;
+
+    return (
+      <div className={`route-leg-card ${routeLeg.mode === "WALK" ? "is-walk" : "is-transit"}`}>
+        <div className="route-leg-spine" aria-hidden="true">
+          <span>{fromLabel}</span>
+          <i />
+          <span>{toLabel}</span>
+        </div>
+        <div className="route-leg-content">
+          <div className="route-leg-header">
+            <div>
+              <p>{fromLabel} → {toLabel}</p>
+              <strong>{fromStop.name} → {toStop.name}</strong>
+            </div>
+            <div className="route-leg-stats">
+              <span>{formatDuration(routeLeg.durationSeconds)}</span>
+              <span>{formatDistance(routeLeg.distanceMeters)}</span>
+              {routeLeg.mode === "TRANSIT" && typeof routeLeg.transfers === "number" && <span>换乘 {routeLeg.transfers} 次</span>}
+              {fareText && <span>{fareText}</span>}
+            </div>
+          </div>
+          <ol className="route-step-list" aria-label={`${fromStop.name} 到 ${toStop.name} 的路线步骤`}>
+            {legSteps.map((step, stepIndex) => {
+              const walking = isWalkingStep(step);
+              const stationText = routeStepStations(step);
+              const instruction = cleanInstruction(step.instructions);
+              const meta = routeStepMeta(step);
+              return (
+                <li className={`route-step ${walking ? "is-walk" : "is-transit"}`} key={`${fromStop.id}-${toStop.id}-${stepIndex}`}>
+                  <div className="route-step-icon">
+                    {walking ? <Footprints size={15} /> : <RouteSummaryIcon size={15} />}
+                  </div>
+                  <div className="route-step-copy">
+                    <div className="route-step-main">
+                      <strong>{routeStepTitle(step)}</strong>
+                      {meta && <span>{meta}</span>}
+                    </div>
+                    {stationText && <p>{stationText}</p>}
+                    {instruction && instruction !== stationText && <p className="route-step-note">{instruction}</p>}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      </div>
+    );
+  };
 
   if (!activePlanId) {
     return (
@@ -2093,13 +2261,84 @@ export default function App() {
           </div>
         </header>
 
+        <div className="date-time-grid">
+          <label className="field">
+            <span>日期</span>
+            <input
+              type="date"
+              value={tripDate}
+              onInput={(event) => setTripDate(event.currentTarget.value)}
+              onChange={(event) => setTripDate(event.currentTarget.value)}
+            />
+          </label>
+          <label className="field">
+            <span>出发时间</span>
+            <input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
+          </label>
+        </div>
+
+        <div className="departure-panel">
+          <div className="departure-row">
+            <input
+              value={departureQuery}
+              placeholder="搜索出发点，例如 京都站 / 新宿站"
+              onChange={(event) => {
+                setDepartureQuery(event.target.value);
+                setDepartureResults([]);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  void searchDeparturePoint();
+                }
+              }}
+            />
+            <button className="secondary-button" type="button" disabled={isSearching} onClick={searchDeparturePoint}>
+              <LocateFixed size={17} />
+              设置起点
+            </button>
+          </div>
+          {departureResults.length > 0 && (
+            <div className="departure-results">
+              {departureResults.map((result) => (
+                <button key={result.id} type="button" onClick={() => setDepartureFromResult(result)}>
+                  <strong>{result.name}</strong>
+                  <span>{result.address}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {departureStop && (
+            <div className="departure-current">
+              <MapPin size={16} />
+              <div>
+                <strong>{departureStop.name}</strong>
+                <span>{departureStop.address || `${departureStop.location.lat.toFixed(5)}, ${departureStop.location.lng.toFixed(5)}`}</span>
+              </div>
+              <button
+                className="icon-button danger"
+                type="button"
+                title="清除出发点"
+                aria-label="清除出发点"
+                onClick={() => {
+                  setDepartureStop(null);
+                  setDepartureQuery("");
+                  setDepartureResults([]);
+                  setRoutePlan(null);
+                }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+          )}
+        </div>
+
         <div className="search-wrap">
           <div className="search-row">
             <MapPin size={18} />
             <input
               ref={searchInputRef}
               className="place-search"
-              placeholder={mapProvider === "google" ? "搜索地点，或粘贴地图链接/坐标" : "搜索 OSM 地点，或粘贴坐标/地图链接"}
+              placeholder={mapProvider === "google" ? "添加要去的地点，或粘贴地图链接/坐标" : "添加 OSM 地点，或粘贴坐标/地图链接"}
               onKeyDown={handleSearchEnter}
             />
             <button
@@ -2122,55 +2361,6 @@ export default function App() {
               ))}
             </div>
           )}
-        </div>
-
-        <div className="date-time-grid">
-          <label className="field">
-            <span>日期</span>
-            <input
-              type="date"
-              value={tripDate}
-              onInput={(event) => setTripDate(event.currentTarget.value)}
-              onChange={(event) => setTripDate(event.currentTarget.value)}
-            />
-          </label>
-          <div className="time-preference-tabs" aria-label="路线时间类型">
-            <button
-              type="button"
-              className={transitTimePreference === "departure" ? "is-active" : ""}
-              onClick={() => setTransitTimePreference("departure")}
-            >
-              出发
-            </button>
-            <button
-              type="button"
-              className={transitTimePreference === "arrival" ? "is-active" : ""}
-              onClick={() => setTransitTimePreference("arrival")}
-            >
-              到达
-            </button>
-          </div>
-        </div>
-
-        <div className="control-grid">
-          <label className="field">
-            <span>{transitTimePreference === "arrival" ? "到达" : "出发"}</span>
-            <input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
-          </label>
-          <div className="routing-policy" aria-label="路线策略">
-            <span>
-              <Footprints size={16} />
-              1km 内步行
-            </span>
-            <span>
-              <TrainFront size={16} />
-              超过 1km 优先公共交通
-            </span>
-            <span>
-              <Route size={16} />
-              固定起点，自动排序
-            </span>
-          </div>
         </div>
 
         <div className="anitabi-row">
@@ -2298,26 +2488,16 @@ export default function App() {
         </div>
 
         <section className="stop-list" aria-label="地点列表">
+          {departureStop && stops[0] && routePlan?.legs[0] && (
+            <Fragment key="departure-leg">
+              {renderRouteLegCard(routePlan.legs[0], departureStop, stops[0], "出", "1")}
+            </Fragment>
+          )}
           {stops.map((stop, index) => {
             const item = schedule[index];
             const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
-            const routeLeg = routePlan?.legs[index];
+            const routeLeg = routePlan?.legs[departureStop ? index + 1 : index];
             const nextStop = stops[index + 1];
-            const fareText = formatFare(routeLeg?.fare);
-            const legSteps: RouteStep[] = routeLeg
-              ? routeLeg.steps?.length
-                ? routeLeg.steps
-                : [
-                    {
-                      mode: routeLeg.mode,
-                      line: routeLeg.summary,
-                      durationSeconds: routeLeg.durationSeconds,
-                      distanceMeters: routeLeg.distanceMeters,
-                      from: stop.name,
-                      to: nextStop?.name
-                    }
-                  ]
-              : [];
             const RouteSummaryIcon = routeLeg?.mode === "WALK" ? Footprints : TrainFront;
             return (
               <Fragment key={stop.id}>
@@ -2396,52 +2576,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                {nextStop && routeLeg && (
-                  <div className={`route-leg-card ${routeLeg.mode === "WALK" ? "is-walk" : "is-transit"}`}>
-                    <div className="route-leg-spine" aria-hidden="true">
-                      <span>{index + 1}</span>
-                      <i />
-                      <span>{index + 2}</span>
-                    </div>
-                    <div className="route-leg-content">
-                      <div className="route-leg-header">
-                        <div>
-                          <p>{index + 1} → {index + 2}</p>
-                          <strong>{stop.name} → {nextStop.name}</strong>
-                        </div>
-                        <div className="route-leg-stats">
-                          <span>{formatDuration(routeLeg.durationSeconds)}</span>
-                          <span>{formatDistance(routeLeg.distanceMeters)}</span>
-                          {routeLeg.mode === "TRANSIT" && typeof routeLeg.transfers === "number" && <span>换乘 {routeLeg.transfers} 次</span>}
-                          {fareText && <span>{fareText}</span>}
-                        </div>
-                      </div>
-                      <ol className="route-step-list" aria-label={`${stop.name} 到 ${nextStop.name} 的路线步骤`}>
-                        {legSteps.map((step, stepIndex) => {
-                          const walking = isWalkingStep(step);
-                          const stationText = routeStepStations(step);
-                          const instruction = cleanInstruction(step.instructions);
-                          const meta = routeStepMeta(step);
-                          return (
-                            <li className={`route-step ${walking ? "is-walk" : "is-transit"}`} key={`${stop.id}-${stepIndex}`}>
-                              <div className="route-step-icon">
-                                {walking ? <Footprints size={15} /> : <TrainFront size={15} />}
-                              </div>
-                              <div className="route-step-copy">
-                                <div className="route-step-main">
-                                  <strong>{routeStepTitle(step)}</strong>
-                                  {meta && <span>{meta}</span>}
-                                </div>
-                                {stationText && <p>{stationText}</p>}
-                                {instruction && instruction !== stationText && <p className="route-step-note">{instruction}</p>}
-                              </div>
-                            </li>
-                          );
-                        })}
-                      </ol>
-                    </div>
-                  </div>
-                )}
+                {nextStop && routeLeg && renderRouteLegCard(routeLeg, stop, nextStop, String(index + 1), String(index + 2))}
               </Fragment>
             );
           })}
