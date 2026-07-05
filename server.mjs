@@ -33,6 +33,8 @@ const osrmProfiles = {
 
 const transitousUserAgent =
   process.env.TRANSITOUS_USER_AGENT || "DaytripPlanner/0.1 local prototype contact=local";
+const bangumiUserAgent =
+  process.env.BANGUMI_USER_AGENT || "DaytripPlanner/0.1 local prototype contact=local";
 const autoTransitThresholdMeters = 1000;
 const navitimeRequestsPerMinute = 50;
 const navitimeMinRequestIntervalMs = Math.ceil(60000 / navitimeRequestsPerMinute);
@@ -654,6 +656,55 @@ function normalizeNavitimeRoute(route, fromStop, toStop) {
   };
 }
 
+async function requestAnitabiLite(subjectId) {
+  const upstream = await fetch(`https://api.anitabi.cn/bangumi/${subjectId}/lite`, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+  const payload = await upstream.json().catch(() => ({}));
+
+  if (upstream.status === 404) {
+    return null;
+  }
+
+  if (!upstream.ok) {
+    const error = new Error(payload?.message || "Anitabi API request failed.");
+    error.status = upstream.status;
+    error.details = payload;
+    throw error;
+  }
+
+  return payload;
+}
+
+function normalizeAnitabiSearchResult(subject, lite) {
+  const id = Number(lite?.id || subject?.id);
+  if (!Number.isFinite(id)) return null;
+
+  const litePoints = Array.isArray(lite?.litePoints) ? lite.litePoints : [];
+  const pointsLength = Number(lite?.pointsLength) || litePoints.length || 0;
+  const imagesLength = Number(lite?.imagesLength) || litePoints.filter((point) => point?.image).length || 0;
+
+  if (!pointsLength && !imagesLength) return null;
+
+  return {
+    id,
+    cn: cleanText(lite?.cn || subject?.name_cn, "", 180),
+    title: cleanText(lite?.title || subject?.name, `Bangumi ${id}`, 180),
+    date: cleanText(subject?.date || subject?.air_date, "", 40),
+    city: cleanText(lite?.city, "", 80),
+    cover: cleanText(lite?.cover || subject?.images?.medium || subject?.image, "", 500),
+    pointsLength,
+    imagesLength,
+    modified: Number(lite?.modified) || null,
+    samplePoints: litePoints
+      .slice(0, 3)
+      .map((point) => cleanText(point?.cn || point?.name, "", 80))
+      .filter(Boolean)
+  };
+}
+
 async function requestNavitimePair({
   fromStop,
   toStop,
@@ -945,6 +996,7 @@ app.delete("/api/plans/:id", async (req, res) => {
     await deleteStoredPlan(req.params.id);
     return res.json({ ok: true });
   } catch (error) {
+    console.error("[plans] delete failed", error);
     return res.status(error.status || 500).json({
       error: error instanceof Error ? error.message : "Failed to delete plan."
     });
@@ -1340,6 +1392,69 @@ app.post("/api/free-route", async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       error: error instanceof Error ? error.message : "Unknown free routing error."
+    });
+  }
+});
+
+app.get("/api/anitabi/search", async (req, res) => {
+  const query = String(req.query.q || "").trim();
+  if (!/^\d+$/.test(query) && query.length < 2) {
+    return res.status(400).json({ error: "Search query is too short." });
+  }
+
+  try {
+    if (/^\d+$/.test(query)) {
+      const lite = await requestAnitabiLite(query);
+      const result = lite
+        ? normalizeAnitabiSearchResult(
+            { id: Number(query), name: lite.title, name_cn: lite.cn },
+            lite
+          )
+        : null;
+      return res.json({ results: result ? [result] : [] });
+    }
+
+    const upstream = await fetch("https://api.bgm.tv/v0/search/subjects?limit=12&offset=0", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": bangumiUserAgent
+      },
+      body: JSON.stringify({
+        keyword: query,
+        filter: {
+          type: [2]
+        }
+      })
+    });
+    const payload = await upstream.json().catch(() => ({}));
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        error: payload?.description || payload?.message || "Bangumi search request failed.",
+        details: payload
+      });
+    }
+
+    const subjects = Array.isArray(payload?.data) ? payload.data : [];
+    const checked = await Promise.allSettled(
+      subjects.map(async (subject) => {
+        const lite = await requestAnitabiLite(subject.id);
+        return lite ? normalizeAnitabiSearchResult(subject, lite) : null;
+      })
+    );
+
+    const results = checked
+      .filter((item) => item.status === "fulfilled" && item.value)
+      .map((item) => item.value)
+      .slice(0, 8);
+
+    return res.json({ results });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Unknown Anitabi search error.",
+      details: error.details
     });
   }
 });

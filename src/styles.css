@@ -407,6 +407,69 @@ h1 {
   font-weight: 800;
 }
 
+.anitabi-results {
+  display: grid;
+  gap: 8px;
+  max-height: 300px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.anitabi-result-card {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) 88px;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.anitabi-result-cover {
+  width: 52px;
+  height: 72px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: #e8f0ee;
+}
+
+.anitabi-result-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.anitabi-result-copy strong,
+.anitabi-result-copy span,
+.anitabi-result-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.anitabi-result-copy strong {
+  color: #152b27;
+  font-size: 14px;
+}
+
+.anitabi-result-copy span {
+  color: #41544f;
+  font-size: 12px;
+}
+
+.anitabi-result-copy small {
+  color: #71827e;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.anitabi-result-card .secondary-button {
+  min-height: 38px;
+  padding: 0 10px;
+}
+
 .field {
   display: grid;
   gap: 5px;
@@ -1350,6 +1413,25 @@ h1 {
   .anitabi-row,
   .route-actions {
     grid-template-columns: 1fr;
+  }
+
+  .anitabi-results {
+    max-height: 240px;
+  }
+
+  .anitabi-result-card {
+    grid-template-columns: 46px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .anitabi-result-cover {
+    width: 46px;
+    height: 64px;
+  }
+
+  .anitabi-result-card .secondary-button {
+    grid-column: 1 / -1;
+    min-height: 36px;
   }
 
   .selection-actions {

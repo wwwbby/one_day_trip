@@ -113,6 +113,18 @@ type SearchResult = {
   source: string;
 };
 
+type AnitabiSearchResult = {
+  id: number;
+  cn?: string;
+  title?: string;
+  date?: string;
+  city?: string;
+  cover?: string;
+  pointsLength?: number;
+  imagesLength?: number;
+  samplePoints?: string[];
+};
+
 type ScheduleItem = {
   stop: Stop;
   arrival: number;
@@ -139,6 +151,7 @@ const autoTransitThresholdMeters = 1000;
 const routeRequestQuotaPerMinute = 50;
 const planCacheStorageKey = "daytrip-planner.plans.v1";
 const planServerMigrationKey = "daytrip-planner.server-migrated.v1";
+const newPlanDraftStorageKey = "daytrip-planner.new-plan-draft.v1";
 
 const initialStops = (): Stop[] => [
   {
@@ -189,6 +202,27 @@ function todayInputValue() {
   const month = String(now.getMonth() + 1).padStart(2, "0");
   const day = String(now.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function isDateInputValue(value: unknown) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function loadNewPlanDraft() {
+  const fallback = { date: todayInputValue(), name: "" };
+  if (typeof window === "undefined") return fallback;
+
+  try {
+    const stored = window.localStorage.getItem(newPlanDraftStorageKey);
+    if (!stored) return fallback;
+    const parsed = JSON.parse(stored);
+    return {
+      date: isDateInputValue(parsed?.date) ? parsed.date : fallback.date,
+      name: typeof parsed?.name === "string" ? parsed.name.slice(0, 180) : ""
+    };
+  } catch {
+    return fallback;
+  }
 }
 
 function clonePlain<T>(value: T): T {
@@ -315,13 +349,31 @@ function loadLocalCachedPlans() {
 
 async function readPlansFromServer() {
   const response = await fetch("/api/plans");
-  const data = await response.json();
   if (!response.ok) {
-    throw new Error(data?.error || "服务端规划读取失败。");
+    throw new Error(await readApiError(response, "服务端规划读取失败。"));
   }
+  const data = await response.json();
   return Array.isArray(data?.plans)
     ? (data.plans.map(normalizeDayPlan).filter(Boolean) as DayPlan[])
     : [];
+}
+
+async function readApiError(response: Response, fallback: string) {
+  const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  const contentType = response.headers.get("content-type") || "";
+
+  try {
+    if (contentType.includes("application/json")) {
+      const data = await response.json();
+      const message = typeof data?.error === "string" ? data.error : "";
+      return message ? `${fallback}（${status}：${message}）` : `${fallback}（${status}）`;
+    }
+
+    const text = (await response.text()).replace(/\s+/g, " ").trim().slice(0, 160);
+    return text ? `${fallback}（${status}：${text}）` : `${fallback}（${status}）`;
+  } catch {
+    return `${fallback}（${status}）`;
+  }
 }
 
 async function writePlanToServer(plan: DayPlan) {
@@ -330,10 +382,10 @@ async function writePlanToServer(plan: DayPlan) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ plan })
   });
-  const data = await response.json();
   if (!response.ok) {
-    throw new Error(data?.error || "规划保存到服务端失败。");
+    throw new Error(await readApiError(response, "规划保存到服务端失败。"));
   }
+  const data = await response.json();
   return normalizeDayPlan(data?.plan) || plan;
 }
 
@@ -343,10 +395,10 @@ async function createPlanOnServer(plan: DayPlan) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ plan })
   });
-  const data = await response.json();
   if (!response.ok) {
-    throw new Error(data?.error || "规划创建到服务端失败。");
+    throw new Error(await readApiError(response, "规划创建到服务端失败。"));
   }
+  const data = await response.json();
   return normalizeDayPlan(data?.plan) || plan;
 }
 
@@ -354,9 +406,8 @@ async function deletePlanFromServer(id: string) {
   const response = await fetch(`/api/plans/${encodeURIComponent(id)}`, {
     method: "DELETE"
   });
-  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error || "服务端规划删除失败。");
+    throw new Error(await readApiError(response, "服务端规划删除失败。"));
   }
 }
 
@@ -749,10 +800,11 @@ function loadGoogleMaps(apiKey: string) {
 
 export default function App() {
   const [plans, setPlans] = useState<DayPlan[]>(loadLocalCachedPlans);
+  const [newPlanDraft] = useState(loadNewPlanDraft);
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
   const [planName, setPlanName] = useState("");
-  const [newPlanName, setNewPlanName] = useState("");
-  const [newPlanDate, setNewPlanDate] = useState(todayInputValue);
+  const [newPlanName, setNewPlanName] = useState(() => newPlanDraft.name);
+  const [newPlanDate, setNewPlanDate] = useState(() => newPlanDraft.date);
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [isLoadingPlans, setIsLoadingPlans] = useState(true);
   const [planSyncMode, setPlanSyncMode] = useState<"server" | "local">("local");
@@ -764,8 +816,10 @@ export default function App() {
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
   const [isRouting, setIsRouting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [isSearchingAnitabi, setIsSearchingAnitabi] = useState(false);
   const [isImportingAnitabi, setIsImportingAnitabi] = useState(false);
-  const [anitabiSubjectId, setAnitabiSubjectId] = useState("");
+  const [anitabiQuery, setAnitabiQuery] = useState("");
+  const [anitabiResults, setAnitabiResults] = useState<AnitabiSearchResult[]>([]);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
@@ -820,7 +874,8 @@ export default function App() {
     setSelectedStopId(null);
     setSelectedStopIds([]);
     setSearchResults([]);
-    setAnitabiSubjectId("");
+    setAnitabiQuery("");
+    setAnitabiResults([]);
     setIsBoxSelectMode(false);
     setSelectionRect(null);
     setLastSavedAt(plan.updatedAt);
@@ -1198,6 +1253,20 @@ export default function App() {
   useEffect(() => {
     plansRef.current = plans;
   }, [plans]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        newPlanDraftStorageKey,
+        JSON.stringify({
+          date: isDateInputValue(newPlanDate) ? newPlanDate : todayInputValue(),
+          name: newPlanName
+        })
+      );
+    } catch (error) {
+      console.error("Failed to persist new plan draft", error);
+    }
+  }, [newPlanDate, newPlanName]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1742,20 +1811,45 @@ export default function App() {
     }
   }, []);
 
-  const importAnitabiLitePoints = useCallback(async () => {
-    const subjectId = anitabiSubjectId.trim();
+  const searchAnitabiWorks = useCallback(async () => {
+    const query = anitabiQuery.trim();
+    if (!/^\d+$/.test(query) && query.length < 2) {
+      setToast("请输入至少两个字的作品名。");
+      return;
+    }
+
+    setIsSearchingAnitabi(true);
+    setAnitabiResults([]);
+    try {
+      const response = await fetch(`/api/anitabi/search?q=${encodeURIComponent(query)}`);
+      if (!response.ok) {
+        throw new Error(await readApiError(response, "Anitabi 作品查找失败。"));
+      }
+      const data = await response.json();
+      const results = Array.isArray(data?.results) ? data.results : [];
+      setAnitabiResults(results);
+      setToast(results.length ? `找到 ${results.length} 个可导入作品。` : "没有找到含截图点位的 Anitabi 作品。");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Anitabi 作品查找失败。");
+    } finally {
+      setIsSearchingAnitabi(false);
+    }
+  }, [anitabiQuery]);
+
+  const importAnitabiSubjectPoints = useCallback(async (subjectIdInput: number | string) => {
+    const subjectId = String(subjectIdInput).trim();
     if (!/^\d+$/.test(subjectId)) {
-      setToast("请输入数字形式的 Bangumi subject ID。");
+      setToast("请选择有效的 Bangumi subject。");
       return;
     }
 
     setIsImportingAnitabi(true);
     try {
       const response = await fetch(`/api/anitabi/bangumi/${subjectId}/detail`);
-      const data = await response.json();
       if (!response.ok) {
-        throw new Error(data?.error || "Anitabi 导入失败。");
+        throw new Error(await readApiError(response, "Anitabi 导入失败。"));
       }
+      const data = await response.json();
 
       const subject = data.subject || {};
       const workTitle = subject.cn || subject.title || `Bangumi ${subjectId}`;
@@ -1793,13 +1887,15 @@ export default function App() {
 
       setStops((current) => [...current, ...importedStops]);
       setRoutePlan(null);
+      setAnitabiQuery(workTitle);
+      setAnitabiResults([]);
       setToast(`已导入 ${importedStops.length} 个 Anitabi 截图点位。鼠标悬浮地点或地图标记可看图。`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Anitabi 导入失败。");
     } finally {
       setIsImportingAnitabi(false);
     }
-  }, [anitabiSubjectId]);
+  }, []);
 
   const clearTrip = useCallback(() => {
     setStops([]);
@@ -1883,7 +1979,12 @@ export default function App() {
           <div className="new-plan-panel">
             <label className="field">
               <span>日期</span>
-              <input type="date" value={newPlanDate} onChange={(event) => setNewPlanDate(event.target.value)} />
+              <input
+                type="date"
+                value={newPlanDate}
+                onInput={(event) => setNewPlanDate(event.currentTarget.value)}
+                onChange={(event) => setNewPlanDate(event.currentTarget.value)}
+              />
             </label>
             <label className="field new-plan-name">
               <span>规划名称</span>
@@ -2026,7 +2127,12 @@ export default function App() {
         <div className="date-time-grid">
           <label className="field">
             <span>日期</span>
-            <input type="date" value={tripDate} onChange={(event) => setTripDate(event.target.value)} />
+            <input
+              type="date"
+              value={tripDate}
+              onInput={(event) => setTripDate(event.currentTarget.value)}
+              onChange={(event) => setTripDate(event.currentTarget.value)}
+            />
           </label>
           <div className="time-preference-tabs" aria-label="路线时间类型">
             <button
@@ -2069,21 +2175,68 @@ export default function App() {
 
         <div className="anitabi-row">
           <input
-            inputMode="numeric"
-            value={anitabiSubjectId}
-            placeholder="Bangumi subject ID"
-            onChange={(event) => setAnitabiSubjectId(event.target.value)}
+            value={anitabiQuery}
+            placeholder="输入作品名，如 吹响吧 / CLANNAD"
+            onChange={(event) => {
+              setAnitabiQuery(event.target.value);
+              setAnitabiResults([]);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
-                void importAnitabiLitePoints();
+                void searchAnitabiWorks();
               }
             }}
           />
-          <button className="secondary-button" type="button" disabled={isImportingAnitabi} onClick={importAnitabiLitePoints}>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={isSearchingAnitabi || isImportingAnitabi}
+            onClick={searchAnitabiWorks}
+          >
             <MapPin size={18} />
-            {isImportingAnitabi ? "导入中" : "导入 Anitabi"}
+            {isSearchingAnitabi ? "查找中" : "查找 Anitabi"}
           </button>
         </div>
+        {anitabiResults.length > 0 && (
+          <div className="anitabi-results" aria-label="Anitabi 作品候选">
+            {anitabiResults.map((result) => {
+              const displayTitle = result.cn || result.title || `Bangumi ${result.id}`;
+              const originalTitle = result.title && result.title !== displayTitle ? result.title : "";
+              const meta = [
+                result.city,
+                result.date,
+                `${result.pointsLength || 0} 点位`,
+                `${result.imagesLength || 0} 截图`
+              ].filter(Boolean);
+              return (
+                <article className="anitabi-result-card" key={result.id}>
+                  {result.cover ? (
+                    <img className="anitabi-result-cover" src={result.cover} alt="" loading="lazy" />
+                  ) : (
+                    <div className="anitabi-result-cover" aria-hidden="true" />
+                  )}
+                  <div className="anitabi-result-copy">
+                    <strong>{displayTitle}</strong>
+                    {originalTitle && <span>{originalTitle}</span>}
+                    <small>{meta.join(" / ")}</small>
+                    {Array.isArray(result.samplePoints) && result.samplePoints.length > 0 && (
+                      <small>{result.samplePoints.join("、")}</small>
+                    )}
+                  </div>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={isImportingAnitabi}
+                    onClick={() => void importAnitabiSubjectPoints(result.id)}
+                  >
+                    <Upload size={16} />
+                    {isImportingAnitabi ? "导入中" : "导入"}
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+        )}
 
         <div className="route-actions">
           <button className="primary-button" type="button" disabled={isRouting} onClick={() => calculateRoute()}>
