@@ -317,6 +317,13 @@ h1 {
   box-shadow: 0 16px 38px rgba(21, 43, 39, 0.16);
 }
 
+.search-result-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px;
+  align-items: stretch;
+  gap: 5px;
+}
+
 .search-results button {
   display: grid;
   gap: 2px;
@@ -332,6 +339,15 @@ h1 {
 
 .search-results button:hover {
   background: #edf4f2;
+}
+
+.search-results .search-result-end {
+  place-items: center;
+  color: #31534f;
+  background: #edf4f2;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 900;
 }
 
 .search-results strong,
@@ -358,7 +374,7 @@ h1 {
 
 .date-time-grid {
   display: grid;
-  grid-template-columns: 1fr 150px;
+  grid-template-columns: minmax(0, 1fr) 124px 124px;
   gap: 10px;
 }
 
@@ -813,6 +829,19 @@ h1 {
   box-shadow: 0 0 0 3px rgba(22, 124, 128, 0.14);
 }
 
+.stop-card.is-fixed {
+  border-color: #d5b85f;
+}
+
+.stop-card.is-endpoint {
+  border-color: #3d6f9f;
+}
+
+.stop-card.is-late {
+  border-color: #d94f45;
+  box-shadow: 0 0 0 3px rgba(217, 79, 69, 0.14);
+}
+
 .stop-image-preview,
 .anitabi-preview-card {
   width: 188px;
@@ -884,6 +913,16 @@ h1 {
   font-weight: 900;
 }
 
+.stop-card.is-fixed .stop-index,
+.stop-marker.is-fixed {
+  background: #c8961a;
+}
+
+.stop-card.is-endpoint .stop-index,
+.stop-marker.is-endpoint {
+  background: #3d6f9f;
+}
+
 .stop-body {
   min-width: 0;
 }
@@ -926,6 +965,47 @@ h1 {
   color: #8b9b97;
 }
 
+.stop-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0 0 7px;
+}
+
+.compact-field {
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 4px 7px;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.compact-field span {
+  color: #687976;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.compact-field select,
+.compact-field input {
+  min-width: 0;
+  height: 24px;
+  padding: 0 4px;
+  color: #193631;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.time-window-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
 .stop-meta {
   display: flex;
   flex-wrap: wrap;
@@ -943,6 +1023,11 @@ h1 {
   background: #edf4f2;
   font-size: 12px;
   font-weight: 800;
+}
+
+.stop-meta .is-late-badge {
+  color: #ffffff;
+  background: #d94f45;
 }
 
 .stop-meta .route-summary {
@@ -1145,11 +1230,11 @@ h1 {
   background: #fbfcfb;
 }
 
-.stay-field input {
-  width: 48px;
-  text-align: right;
-  font-size: 14px;
+.stay-field strong {
+  color: #142b27;
+  font-size: 15px;
   font-weight: 900;
+  text-align: right;
 }
 
 .stay-field span {
@@ -1493,8 +1578,12 @@ h1 {
   }
 
   .date-time-grid {
-    grid-template-columns: minmax(0, 1fr) 124px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 8px;
+  }
+
+  .date-time-grid .field:first-child {
+    grid-column: 1 / -1;
   }
 
   .departure-row {

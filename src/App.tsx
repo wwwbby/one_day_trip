@@ -24,6 +24,7 @@ import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, PointerEvent, useCallb
 
 type MapProvider = "google" | "osm";
 type TransitTimePreference = "departure" | "arrival";
+type StopRole = "normal" | "fixed" | "end";
 
 declare global {
   interface Window {
@@ -42,6 +43,9 @@ type Stop = {
     lng: number;
   };
   stayMinutes: number;
+  role?: StopRole;
+  windowStart?: string;
+  windowEnd?: string;
   note?: string;
   source?: string;
   imageUrl?: string;
@@ -97,6 +101,7 @@ type DayPlan = {
   name: string;
   tripDate: string;
   startTime: string;
+  departureEndTime?: string;
   departureStop?: Stop | null;
   transitTimePreference: TransitTimePreference;
   stops: Stop[];
@@ -129,7 +134,10 @@ type AnitabiSearchResult = {
 type ScheduleItem = {
   stop: Stop;
   arrival: number;
+  visitStart: number;
   departure: number;
+  waitMinutes: number;
+  isLate: boolean;
   travelToNextMinutes: number;
 };
 
@@ -148,11 +156,13 @@ type SelectionRect = {
 const browserApiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
 const googleMapId = (import.meta.env.VITE_GOOGLE_MAP_ID as string | undefined) || "DEMO_MAP_ID";
 const defaultCenter = { lat: 34.985849, lng: 135.758766 };
+const pilgrimageStayMinutes = 5;
 const autoTransitThresholdMeters = 1000;
 const routeRequestQuotaPerMinute = 50;
 const planCacheStorageKey = "daytrip-planner.plans.v1";
 const planServerMigrationKey = "daytrip-planner.server-migrated.v1";
 const newPlanDraftStorageKey = "daytrip-planner.new-plan-draft.v1";
+const activePlanStorageKey = "daytrip-planner.active-plan-id.v1";
 
 const initialStops = (): Stop[] => [
   {
@@ -160,7 +170,7 @@ const initialStops = (): Stop[] => [
     name: "京都站",
     address: "京都府京都市下京区",
     location: defaultCenter,
-    stayMinutes: 15,
+    stayMinutes: 0,
     note: "出发点",
     source: "sample"
   },
@@ -169,7 +179,7 @@ const initialStops = (): Stop[] => [
     name: "伏见稻荷大社",
     address: "京都府京都市伏见区深草薮之内町68",
     location: { lat: 34.96714, lng: 135.772672 },
-    stayMinutes: 75,
+    stayMinutes: pilgrimageStayMinutes,
     source: "sample"
   },
   {
@@ -177,7 +187,7 @@ const initialStops = (): Stop[] => [
     name: "宇治桥",
     address: "京都府宇治市宇治",
     location: { lat: 34.89289, lng: 135.80754 },
-    stayMinutes: 35,
+    stayMinutes: pilgrimageStayMinutes,
     source: "sample"
   },
   {
@@ -185,7 +195,7 @@ const initialStops = (): Stop[] => [
     name: "平等院",
     address: "京都府宇治市宇治莲华116",
     location: { lat: 34.889304, lng: 135.807681 },
-    stayMinutes: 60,
+    stayMinutes: pilgrimageStayMinutes,
     source: "sample"
   }
 ];
@@ -207,6 +217,16 @@ function todayInputValue() {
 
 function isDateInputValue(value: unknown) {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function normalizeClockValue(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return undefined;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour > 23 || minute > 59) return undefined;
+  return value;
 }
 
 function loadNewPlanDraft() {
@@ -270,6 +290,7 @@ function createDayPlan(input: Partial<DayPlan> = {}): DayPlan {
     name: input.name?.trim() || defaultPlanName(tripDate),
     tripDate,
     startTime: input.startTime || "09:00",
+    departureEndTime: input.departureEndTime || input.startTime || "09:00",
     departureStop: input.departureStop ? clonePlain(input.departureStop) : null,
     transitTimePreference: input.transitTimePreference || "departure",
     stops: clonePlain(input.stops || []),
@@ -302,13 +323,18 @@ function normalizeStop(value: any): Stop | null {
   const lat = Number(value?.location?.lat);
   const lng = Number(value?.location?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const stayMinutes = Number(value?.stayMinutes);
+  const role: StopRole = value?.role === "fixed" || value?.role === "end" ? value.role : "normal";
+  const windowStart = role === "fixed" ? normalizeClockValue(value?.windowStart) : undefined;
+  const windowEnd = role === "fixed" ? normalizeClockValue(value?.windowEnd) : undefined;
   return {
     ...value,
     id: String(value?.id || makeId()),
     name: String(value?.name || "未命名地点"),
     location: { lat, lng },
-    stayMinutes: Number.isFinite(stayMinutes) ? stayMinutes : 45
+    role,
+    windowStart,
+    windowEnd,
+    stayMinutes: role === "end" ? 0 : pilgrimageStayMinutes
   };
 }
 
@@ -328,6 +354,7 @@ function normalizeDayPlan(value: any): DayPlan | null {
     name: typeof value.name === "string" && value.name.trim() ? value.name.trim() : defaultPlanName(tripDate),
     tripDate,
     startTime: typeof value.startTime === "string" && value.startTime ? value.startTime : "09:00",
+    departureEndTime: normalizeClockValue(value.departureEndTime) || normalizeClockValue(value.startTime) || "09:00",
     departureStop: normalizeStop(value.departureStop),
     transitTimePreference: value.transitTimePreference === "arrival" ? "arrival" : "departure",
     stops,
@@ -349,6 +376,29 @@ function loadLocalCachedPlans() {
   } catch (error) {
     console.error("Failed to load cached plans", error);
     return defaultDayPlans();
+  }
+}
+
+function readStoredActivePlanId() {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage.getItem(activePlanStorageKey);
+  } catch (error) {
+    console.error("Failed to read active plan id", error);
+    return null;
+  }
+}
+
+function storeActivePlanId(id: string | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (id) {
+      window.sessionStorage.setItem(activePlanStorageKey, id);
+    } else {
+      window.sessionStorage.removeItem(activePlanStorageKey);
+    }
+  } catch (error) {
+    console.error("Failed to persist active plan id", error);
   }
 }
 
@@ -500,8 +550,8 @@ function routeStepStations(step: RouteStep) {
   return step.from || step.to || "";
 }
 
-function parseClock(value: string) {
-  const [hour = "9", minute = "0"] = value.split(":");
+function parseClock(value: string | undefined) {
+  const [hour = "9", minute = "0"] = (normalizeClockValue(value) || "09:00").split(":");
   return Number(hour) * 60 + Number(minute);
 }
 
@@ -510,6 +560,143 @@ function formatClock(totalMinutes: number) {
   const hour = Math.floor(normalized / 60);
   const minute = normalized % 60;
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function clockDiffMinutes(start?: string, end?: string) {
+  const startValue = normalizeClockValue(start);
+  const endValue = normalizeClockValue(end);
+  if (!startValue || !endValue) return null;
+  const diff = parseClock(endValue) - parseClock(startValue);
+  return diff >= 0 ? diff : null;
+}
+
+function getStopRole(stop: Stop): StopRole {
+  return stop.role === "fixed" || stop.role === "end" ? stop.role : "normal";
+}
+
+function isFixedStop(stop: Stop) {
+  return getStopRole(stop) === "fixed";
+}
+
+function isEndpointStop(stop: Stop) {
+  return getStopRole(stop) === "end";
+}
+
+function fixedWindowStartMinutes(stop: Stop) {
+  return isFixedStop(stop) && normalizeClockValue(stop.windowStart) ? parseClock(stop.windowStart) : null;
+}
+
+function fixedWindowEndMinutes(stop: Stop) {
+  return isFixedStop(stop) && normalizeClockValue(stop.windowEnd) ? parseClock(stop.windowEnd) : null;
+}
+
+function fixedArrivalDeadlineMinutes(stop: Stop) {
+  return fixedWindowStartMinutes(stop) ?? fixedWindowEndMinutes(stop);
+}
+
+function stopVisitMinutes(stop: Stop) {
+  if (isEndpointStop(stop)) return 0;
+  if (isFixedStop(stop)) {
+    const windowDuration = clockDiffMinutes(stop.windowStart, stop.windowEnd);
+    return windowDuration !== null ? Math.max(0, windowDuration) : pilgrimageStayMinutes;
+  }
+  return pilgrimageStayMinutes;
+}
+
+function normalizeStopRolePatch(stop: Stop, role: StopRole): Stop {
+  if (role === "end") {
+    return {
+      ...stop,
+      role,
+      windowStart: undefined,
+      windowEnd: undefined,
+      stayMinutes: 0
+    };
+  }
+
+  if (role === "fixed") {
+    const start = normalizeClockValue(stop.windowStart) || "12:00";
+    const end = normalizeClockValue(stop.windowEnd) || formatClock(parseClock(start) + pilgrimageStayMinutes);
+    return {
+      ...stop,
+      role,
+      windowStart: start,
+      windowEnd: end,
+      stayMinutes: pilgrimageStayMinutes
+    };
+  }
+
+  return {
+    ...stop,
+    role: "normal",
+    windowStart: undefined,
+    windowEnd: undefined,
+    stayMinutes: pilgrimageStayMinutes
+  };
+}
+
+function stopRoleLabel(stop: Stop) {
+  const role = getStopRole(stop);
+  if (role === "fixed") return "定点";
+  if (role === "end") return "终点";
+  return "巡礼";
+}
+
+function stopSequenceLabel(stop: Stop, index: number) {
+  if (isEndpointStop(stop)) return "终";
+  if (isFixedStop(stop)) return "定";
+  return String(index + 1);
+}
+
+function estimateTravelMinutes(a: Stop, b: Stop) {
+  const distance = haversineMeters(a, b);
+  if (distance <= autoTransitThresholdMeters) {
+    return Math.max(3, Math.ceil(distance / 75));
+  }
+  return Math.max(12, Math.ceil(distance / 360) + 8);
+}
+
+function appendBeforeEndpoint(current: Stop[], additions: Stop[]) {
+  const endpoint = current.find(isEndpointStop);
+  if (!endpoint) return [...current, ...additions];
+  return [
+    ...current.filter((stop) => !isEndpointStop(stop)),
+    ...additions,
+    endpoint
+  ];
+}
+
+function buildScheduleItems(stops: Stop[], legs: RouteLeg[] | undefined, hasDepartureStop: boolean, routeDepartureTime: string) {
+  let cursor = parseClock(routeDepartureTime);
+  return stops.map((stop, index) => {
+    const inboundLegIndex = hasDepartureStop ? index : index - 1;
+    if (inboundLegIndex >= 0) {
+      cursor += Math.round((legs?.[inboundLegIndex]?.durationSeconds || 0) / 60);
+    }
+    const arrival = cursor;
+    const fixedStart = fixedWindowStartMinutes(stop);
+    const fixedEnd = fixedWindowEndMinutes(stop);
+    const visitStart = isFixedStop(stop) && fixedStart !== null ? Math.max(arrival, fixedStart) : arrival;
+    const departure = isEndpointStop(stop)
+      ? arrival
+      : isFixedStop(stop) && fixedEnd !== null
+        ? Math.max(visitStart, fixedEnd)
+        : visitStart + stopVisitMinutes(stop);
+    const deadline = fixedArrivalDeadlineMinutes(stop);
+    const isLate = isFixedStop(stop) && deadline !== null && arrival > deadline;
+    const nextLegIndex = hasDepartureStop ? index + 1 : index;
+    const travelToNextMinutes = Math.round((legs?.[nextLegIndex]?.durationSeconds || 0) / 60);
+    cursor = departure;
+    return {
+      stop,
+      arrival,
+      visitStart,
+      departure,
+      waitMinutes: Math.max(0, visitStart - arrival),
+      isLate,
+      travelToNextMinutes
+    };
+  });
 }
 
 function stopToWaypointLabel(stop: Stop) {
@@ -616,7 +803,7 @@ function parseKmlStops(text: string): Stop[] {
         name,
         address: description,
         location: { lat, lng },
-        stayMinutes: 45,
+        stayMinutes: pilgrimageStayMinutes,
         source: "kml"
       } satisfies Stop;
     })
@@ -688,14 +875,12 @@ function transitCandidateLegCount(stops: Stop[]) {
   return count;
 }
 
-function optimizeStopsForDay(stops: Stop[]) {
-  if (stops.length <= 2) return stops;
-  const origin = stops[0];
-  const remaining = stops.slice(1);
-  const ordered: Stop[] = [origin];
+function nearestStopOrder(origin: Stop, candidates: Stop[]) {
+  const remaining = [...candidates];
+  const ordered: Stop[] = [];
+  let current = origin;
 
   while (remaining.length) {
-    const current = ordered[ordered.length - 1];
     let bestIndex = 0;
     let bestDistance = Number.POSITIVE_INFINITY;
     remaining.forEach((candidate, index) => {
@@ -705,29 +890,62 @@ function optimizeStopsForDay(stops: Stop[]) {
         bestIndex = index;
       }
     });
-    ordered.push(remaining.splice(bestIndex, 1)[0]);
+    const [next] = remaining.splice(bestIndex, 1);
+    ordered.push(next);
+    current = next;
   }
 
-  let improved = true;
-  let passes = 0;
-  while (improved && passes < 8) {
-    improved = false;
-    passes += 1;
-    for (let start = 1; start < ordered.length - 1; start += 1) {
-      for (let end = start + 1; end < ordered.length; end += 1) {
-        const before =
-          haversineMeters(ordered[start - 1], ordered[start]) +
-          (end + 1 < ordered.length ? haversineMeters(ordered[end], ordered[end + 1]) : 0);
-        const after =
-          haversineMeters(ordered[start - 1], ordered[end]) +
-          (end + 1 < ordered.length ? haversineMeters(ordered[start], ordered[end + 1]) : 0);
+  return ordered;
+}
 
-        if (after + 1 < before) {
-          ordered.splice(start, end - start + 1, ...ordered.slice(start, end + 1).reverse());
-          improved = true;
+function optimizeStopsForDay(stops: Stop[], startMinutes = parseClock("09:00")) {
+  if (stops.length <= 2) return stops;
+  const origin = stops[0];
+  const endpoint = stops.slice(1).find(isEndpointStop);
+  const middleStops = stops.slice(1).filter((stop) => stop.id !== endpoint?.id);
+  const fixedStops = middleStops
+    .filter(isFixedStop)
+    .sort((a, b) => (fixedArrivalDeadlineMinutes(a) ?? 1440) - (fixedArrivalDeadlineMinutes(b) ?? 1440));
+  const freeStops = middleStops.filter((stop) => !isFixedStop(stop));
+
+  const ordered: Stop[] = [origin];
+  let current = origin;
+  let cursor = startMinutes;
+
+  for (const fixedStop of fixedStops) {
+    const deadline = fixedArrivalDeadlineMinutes(fixedStop);
+    while (freeStops.length && deadline !== null) {
+      let bestIndex = -1;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      freeStops.forEach((candidate, index) => {
+        const projectedArrivalAtFixed =
+          cursor +
+          estimateTravelMinutes(current, candidate) +
+          stopVisitMinutes(candidate) +
+          estimateTravelMinutes(candidate, fixedStop);
+        if (projectedArrivalAtFixed <= deadline && haversineMeters(current, candidate) < bestDistance) {
+          bestDistance = haversineMeters(current, candidate);
+          bestIndex = index;
         }
-      }
+      });
+      if (bestIndex === -1) break;
+      const [next] = freeStops.splice(bestIndex, 1);
+      ordered.push(next);
+      cursor += estimateTravelMinutes(current, next) + stopVisitMinutes(next);
+      current = next;
     }
+
+    ordered.push(fixedStop);
+    const arrival = cursor + estimateTravelMinutes(current, fixedStop);
+    const visitStart = Math.max(arrival, fixedWindowStartMinutes(fixedStop) ?? arrival);
+    cursor = fixedWindowEndMinutes(fixedStop) ?? visitStart + stopVisitMinutes(fixedStop);
+    current = fixedStop;
+  }
+
+  const remainingOrdered = nearestStopOrder(current, freeStops);
+  ordered.push(...remainingOrdered);
+  if (endpoint) {
+    ordered.push(endpoint);
   }
 
   return ordered;
@@ -813,6 +1031,7 @@ export default function App() {
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   const [tripDate, setTripDate] = useState(todayInputValue);
   const [startTime, setStartTime] = useState("09:00");
+  const [departureEndTime, setDepartureEndTime] = useState("09:00");
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
   const [isRouting, setIsRouting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
@@ -845,6 +1064,7 @@ export default function App() {
   const leafletPolylineRef = useRef<L.Polyline | null>(null);
   const selectionStartRef = useRef<MapPoint | null>(null);
   const plansRef = useRef<DayPlan[]>(plans);
+  const pendingActivePlanIdRef = useRef<string | null>(readStoredActivePlanId());
 
   const persistPlanToServer = useCallback(
     async (plan: DayPlan) => {
@@ -865,10 +1085,13 @@ export default function App() {
   );
 
   const loadPlanIntoEditor = useCallback((plan: DayPlan) => {
+    pendingActivePlanIdRef.current = null;
+    storeActivePlanId(plan.id);
     setActivePlanId(plan.id);
     setPlanName(plan.name);
     setTripDate(plan.tripDate);
     setStartTime(plan.startTime);
+    setDepartureEndTime(plan.departureEndTime || plan.startTime);
     setDepartureStop(clonePlain(plan.departureStop || null));
     setDepartureQuery(plan.departureStop?.name || "");
     setDepartureResults([]);
@@ -965,6 +1188,7 @@ export default function App() {
         name: planName.trim() || defaultPlanName(tripDate),
         tripDate,
         startTime,
+        departureEndTime,
         departureStop: clonePlain(departureStop),
         transitTimePreference: "departure" as TransitTimePreference,
         stops: clonePlain(stops),
@@ -993,11 +1217,13 @@ export default function App() {
         }
       }
     },
-    [activePlanId, departureStop, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, tripDate]
+    [activePlanId, departureEndTime, departureStop, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, tripDate]
   );
 
   const backToPlanList = useCallback(() => {
     void saveActivePlan(false);
+    pendingActivePlanIdRef.current = null;
+    storeActivePlanId(null);
     setActivePlanId(null);
     setSelectedStopId(null);
     setSelectedStopIds([]);
@@ -1042,19 +1268,55 @@ export default function App() {
     setMapError(null);
   }, []);
 
-  const addStop = useCallback((stop: Stop) => {
-    setStops((current) => [...current, stop]);
-    setSelectedStopId(stop.id);
+  const addStop = useCallback((stop: Stop, role: StopRole = "normal") => {
+    const nextStop = normalizeStopRolePatch({ ...stop, role }, role);
+    setStops((current) => {
+      if (role === "end") {
+        return [...current.filter((item) => !isEndpointStop(item)), nextStop];
+      }
+      const endpoint = current.find(isEndpointStop);
+      const regularStops = current.filter((item) => !isEndpointStop(item));
+      return endpoint ? [...regularStops, nextStop, endpoint] : [...current, nextStop];
+    });
+    setSelectedStopId(nextStop.id);
     setSelectedStopIds([]);
     setRoutePlan(null);
     setSearchResults([]);
   }, []);
 
   const updateStop = useCallback((id: string, patch: Partial<Stop>, shouldInvalidateRoute = false) => {
-    setStops((current) => current.map((stop) => (stop.id === id ? { ...stop, ...patch } : stop)));
+    setStops((current) =>
+      current.map((stop) => {
+        if (stop.id !== id) return stop;
+        const nextStop = { ...stop, ...patch };
+        return {
+          ...nextStop,
+          stayMinutes: isEndpointStop(nextStop) ? 0 : pilgrimageStayMinutes
+        };
+      })
+    );
     if (shouldInvalidateRoute) {
       setRoutePlan(null);
     }
+  }, []);
+
+  const updateStopRole = useCallback((id: string, role: StopRole) => {
+    setStops((current) => {
+      const next = current
+        .map((stop) => {
+          if (stop.id === id) return normalizeStopRolePatch(stop, role);
+          if (role === "end" && isEndpointStop(stop)) return normalizeStopRolePatch(stop, "normal");
+          return stop;
+        });
+      if (role !== "end") return next;
+      const endpoint = next.find((stop) => stop.id === id);
+      return endpoint
+        ? [...next.filter((stop) => stop.id !== id), endpoint]
+        : next;
+    });
+    setSelectedStopId(id);
+    setSelectedStopIds([]);
+    setRoutePlan(null);
   }, []);
 
   const removeStop = useCallback((id: string) => {
@@ -1098,37 +1360,22 @@ export default function App() {
   );
 
   const schedule = useMemo<ScheduleItem[]>(() => {
-    let cursor = parseClock(startTime);
-    return stops.map((stop, index) => {
-      const inboundLegIndex = departureStop ? index : index - 1;
-      if (inboundLegIndex >= 0) {
-        cursor += Math.round((routePlan?.legs[inboundLegIndex]?.durationSeconds || 0) / 60);
-      }
-      const arrival = cursor;
-      const departure = arrival + stop.stayMinutes;
-      const nextLegIndex = departureStop ? index + 1 : index;
-      const travelToNextMinutes = Math.round((routePlan?.legs[nextLegIndex]?.durationSeconds || 0) / 60);
-      cursor = departure;
-      return {
-        stop,
-        arrival,
-        departure,
-        travelToNextMinutes
-      };
-    });
-  }, [departureStop, routePlan?.legs, startTime, stops]);
+    return buildScheduleItems(stops, routePlan?.legs, Boolean(departureStop), departureEndTime || startTime);
+  }, [departureEndTime, departureStop, routePlan?.legs, startTime, stops]);
 
   const routeMetrics = useMemo(() => {
-    const totalStay = stops.reduce((sum, stop) => sum + stop.stayMinutes, 0);
+    const totalStay = stops.reduce((sum, stop) => sum + stopVisitMinutes(stop), 0);
     const totalTravel = Math.round((routePlan?.durationSeconds || 0) / 60);
-    const end = parseClock(startTime) + totalStay + totalTravel;
+    const end = schedule.length
+      ? schedule[schedule.length - 1].departure
+      : parseClock(departureEndTime || startTime) + totalStay + totalTravel;
     return {
       totalStay,
       totalTravel,
       end,
       distance: routePlan?.distanceMeters || 0
     };
-  }, [routePlan, startTime, stops]);
+  }, [departureEndTime, routePlan, schedule, startTime, stops]);
 
   const routingStatusText = useMemo(() => {
     const legCount = Math.max(0, routeStops.length - 1);
@@ -1338,12 +1585,28 @@ export default function App() {
   }, [plans]);
 
   useEffect(() => {
+    if (activePlanId || isLoadingPlans) return;
+
+    const pendingActivePlanId = pendingActivePlanIdRef.current;
+    if (!pendingActivePlanId) return;
+
+    const plan = plans.find((item) => item.id === pendingActivePlanId);
+    if (plan) {
+      loadPlanIntoEditor(plan);
+      return;
+    }
+
+    pendingActivePlanIdRef.current = null;
+    storeActivePlanId(null);
+  }, [activePlanId, isLoadingPlans, loadPlanIntoEditor, plans]);
+
+  useEffect(() => {
     if (!activePlanId) return undefined;
     const timer = window.setTimeout(() => {
       void saveActivePlan(false);
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [activePlanId, departureStop, planName, routePlan, saveActivePlan, startTime, stops, tripDate]);
+  }, [activePlanId, departureEndTime, departureStop, planName, routePlan, saveActivePlan, startTime, stops, tripDate]);
 
   useEffect(() => {
     if (activePlanId) return;
@@ -1370,7 +1633,7 @@ export default function App() {
         name: "自定义地点",
         address: `${event.latlng.lat.toFixed(6)}, ${event.latlng.lng.toFixed(6)}`,
         location: { lat: event.latlng.lat, lng: event.latlng.lng },
-        stayMinutes: 45,
+        stayMinutes: pilgrimageStayMinutes,
         source: "osm-click"
       });
     });
@@ -1418,7 +1681,7 @@ export default function App() {
             name: "自定义地点",
             address: `${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}`,
             location: { lat: latLng.lat(), lng: latLng.lng() },
-            stayMinutes: 45,
+            stayMinutes: pilgrimageStayMinutes,
             source: "map-click"
           });
         });
@@ -1448,7 +1711,7 @@ export default function App() {
               address: place.formatted_address,
               placeId: place.place_id,
               location: { lat: location.lat(), lng: location.lng() },
-              stayMinutes: 45,
+              stayMinutes: pilgrimageStayMinutes,
               source: "google-places"
             });
             if (searchInputRef.current) {
@@ -1503,8 +1766,8 @@ export default function App() {
       markers.push(...stops.map((stop, index) => {
         const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
         const markerContent = document.createElement("button");
-        markerContent.className = `stop-marker ${selected ? "is-selected" : ""}`;
-        markerContent.textContent = String(index + 1);
+        markerContent.className = `stop-marker ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}`;
+        markerContent.textContent = stopSequenceLabel(stop, index);
         markerContent.title = stop.name;
         markerContent.addEventListener("click", () => setSelectedStopId(stop.id));
 
@@ -1566,7 +1829,7 @@ export default function App() {
       const size = selected ? 37 : 31;
       const icon = L.divIcon({
         className: "leaflet-stop-marker",
-        html: `<button class="stop-marker ${selected ? "is-selected" : ""}">${index + 1}</button>`,
+        html: `<button class="stop-marker ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}">${stopSequenceLabel(stop, index)}</button>`,
         iconSize: [size, size],
         iconAnchor: [size / 2, size / 2]
       });
@@ -1677,15 +1940,15 @@ export default function App() {
   }, []);
 
   const addSearchResult = useCallback(
-    (result: SearchResult) => {
+    (result: SearchResult, role: StopRole = "normal") => {
       addStop({
         id: makeId(),
         name: result.name,
         address: result.address,
         location: { lat: result.lat, lng: result.lng },
-        stayMinutes: 45,
+        stayMinutes: pilgrimageStayMinutes,
         source: result.source
-      });
+      }, role);
       if (searchInputRef.current) {
         searchInputRef.current.value = "";
       }
@@ -1791,13 +2054,23 @@ export default function App() {
         return;
       }
 
-      const transitDateTime = buildLocalDateTimeIso(tripDate, startTime);
+      if (parseClock(departureEndTime) < parseClock(startTime)) {
+        setToast("起点结束时间不能早于开始时间。");
+        return;
+      }
+
+      const routeDepartureTime = departureEndTime || startTime;
+      const transitDateTime = buildLocalDateTimeIso(tripDate, routeDepartureTime);
       if (!transitDateTime) {
         setToast("请选择有效的路线日期和时间。");
         return;
       }
-      const transitLocalDateTime = `${tripDate}T${startTime}:00`;
-      const orderedStops = optimizeStopsForDay(routeStops);
+      const transitLocalDateTime = `${tripDate}T${routeDepartureTime}:00`;
+      const orderedStops = optimizeStopsForDay(routeStops, parseClock(routeDepartureTime));
+      const stopsForRouting = orderedStops.map((stop) => ({
+        ...stop,
+        stayMinutes: stopVisitMinutes(stop)
+      }));
       const orderChanged = !isSameStopOrder(routeStops, orderedStops);
       const beforeDistance = routeDistanceMeters(routeStops);
       const afterDistance = routeDistanceMeters(orderedStops);
@@ -1812,7 +2085,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            stops: orderedStops,
+            stops: stopsForRouting,
             transitDateTime,
             transitLocalDateTime,
             transitTimePreference: "departure"
@@ -1825,18 +2098,19 @@ export default function App() {
           throw new Error("没有返回可用路线。");
         }
 
+        const nextPlanStops = departureStop ? orderedStops.slice(1) : orderedStops;
         if (orderChanged) {
           if (departureStop) {
             setDepartureStop(orderedStops[0] || departureStop);
-            setStops(orderedStops.slice(1));
+            setStops(nextPlanStops);
             setSelectedStopId(orderedStops[1]?.id || null);
           } else {
-            setStops(orderedStops);
+            setStops(nextPlanStops);
             setSelectedStopId(orderedStops[0]?.id || null);
           }
           setSelectedStopIds([]);
         }
-        setRoutePlan({
+        const nextRoutePlan: RoutePlan = {
           distanceMeters: route.distanceMeters || 0,
           durationSeconds: route.durationSeconds || parseDurationSeconds(route.duration),
           encodedPolyline: route.polyline?.encodedPolyline,
@@ -1869,13 +2143,19 @@ export default function App() {
             fare: leg.fare
           })),
           provider: route.provider
-        });
+        };
+        setRoutePlan(nextRoutePlan);
         const fallbackCount = route.strategy?.fallbackWalkingLegs || 0;
+        const lateFixedStops = buildScheduleItems(nextPlanStops, nextRoutePlan.legs, Boolean(departureStop), routeDepartureTime)
+          .filter((item) => item.isLate)
+          .map((item) => item.stop.name);
         const sortMessage = orderChanged
-          ? `已按起点优化访问顺序，直线串联约减少 ${formatDistance(Math.max(0, beforeDistance - afterDistance))}。`
+          ? `已按定点时间窗优化访问顺序，直线串联约减少 ${formatDistance(Math.max(0, beforeDistance - afterDistance))}。`
           : "当前顺序已经比较紧凑。";
         setToast(
-          fallbackCount
+          lateFixedStops.length
+            ? `${sortMessage}${lateFixedStops.slice(0, 3).join("、")} 可能赶不上定点时间，请调整时间窗或删减前序地点。`
+            : fallbackCount
             ? `${sortMessage}${fallbackCount} 段公共交通无结果，已改步行。`
             : `${sortMessage}路线已更新。`
         );
@@ -1885,7 +2165,7 @@ export default function App() {
         setIsRouting(false);
       }
     },
-    [departureStop, routeStops, startTime, tripDate]
+    [departureEndTime, departureStop, routeStops, startTime, tripDate]
   );
 
   const handleSearchEnter = useCallback(
@@ -1900,7 +2180,7 @@ export default function App() {
           name: "坐标地点",
           address: `${coordinates.lat.toFixed(6)}, ${coordinates.lng.toFixed(6)}`,
           location: coordinates,
-          stayMinutes: 45,
+          stayMinutes: pilgrimageStayMinutes,
           source: "coordinate"
         });
         event.currentTarget.value = "";
@@ -1921,7 +2201,7 @@ export default function App() {
         name: "坐标地点",
         address: `${coordinates.lat.toFixed(6)}, ${coordinates.lng.toFixed(6)}`,
         location: coordinates,
-        stayMinutes: 45,
+        stayMinutes: pilgrimageStayMinutes,
         source: "coordinate"
       });
       if (searchInputRef.current) {
@@ -1945,7 +2225,7 @@ export default function App() {
         setToast("没有在 KML 里找到点位。");
         return;
       }
-      setStops((current) => [...current, ...importedStops]);
+      setStops((current) => appendBeforeEndpoint(current, importedStops));
       setRoutePlan(null);
       setToast(`已导入 ${importedStops.length} 个地点。`);
     } catch (error) {
@@ -1984,7 +2264,7 @@ export default function App() {
 
     setIsImportingAnitabi(true);
     try {
-      const response = await fetch(`/api/anitabi/bangumi/${subjectId}/detail`);
+      const response = await fetch(`/api/anitabi/detail?subjectId=${encodeURIComponent(subjectId)}`);
       const data = await readApiJson(response, "Anitabi 导入失败。");
 
       const subject = data.subject || {};
@@ -2003,7 +2283,7 @@ export default function App() {
             .filter(Boolean)
             .join(" / "),
           location: { lat: Number(point.geo[0]), lng: Number(point.geo[1]) },
-          stayMinutes: 20,
+          stayMinutes: pilgrimageStayMinutes,
           note: "巡礼",
           source: `Anitabi ${subjectId}`,
           imageUrl: anitabiImageVariant(point.image),
@@ -2021,7 +2301,7 @@ export default function App() {
         return;
       }
 
-      setStops((current) => [...current, ...importedStops]);
+      setStops((current) => appendBeforeEndpoint(current, importedStops));
       setRoutePlan(null);
       setAnitabiQuery(workTitle);
       setAnitabiResults([]);
@@ -2050,9 +2330,10 @@ export default function App() {
           mapProvider,
           tripDate,
           startTime,
+          departureEndTime,
           departureStop,
           transitTimePreference: "departure",
-          routeStrategy: "departure-point-nearest-neighbor-2opt-transit-first",
+          routeStrategy: "time-window-aware-nearest-neighbor-transit-first",
           stops,
           routePlan
         },
@@ -2062,7 +2343,7 @@ export default function App() {
       "application/json"
     );
     setToast("JSON 已导出。");
-  }, [departureStop, mapProvider, planName, routePlan, startTime, stops, tripDate]);
+  }, [departureEndTime, departureStop, mapProvider, planName, routePlan, startTime, stops, tripDate]);
 
   const copyGoogleMapsLink = useCallback(async () => {
     if (routeStops.length < 2) {
@@ -2311,8 +2592,12 @@ export default function App() {
             />
           </label>
           <label className="field">
-            <span>出发时间</span>
+            <span>起点开始</span>
             <input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
+          </label>
+          <label className="field">
+            <span>起点结束</span>
+            <input type="time" value={departureEndTime} onChange={(event) => setDepartureEndTime(event.target.value)} />
           </label>
         </div>
 
@@ -2398,10 +2683,15 @@ export default function App() {
           {searchResults.length > 0 && (
             <div className="search-results">
               {searchResults.map((result) => (
-                <button key={result.id} type="button" onClick={() => addSearchResult(result)}>
-                  <strong>{result.name}</strong>
-                  <span>{result.address}</span>
-                </button>
+                <div className="search-result-card" key={result.id}>
+                  <button className="search-result-main" type="button" onClick={() => addSearchResult(result)}>
+                    <strong>{result.name}</strong>
+                    <span>{result.address}</span>
+                  </button>
+                  <button className="search-result-end" type="button" onClick={() => addSearchResult(result, "end")}>
+                    设终点
+                  </button>
+                </div>
               ))}
             </div>
           )}
@@ -2534,7 +2824,7 @@ export default function App() {
         <section className="stop-list" aria-label="地点列表">
           {departureStop && stops[0] && routePlan?.legs[0] && (
             <Fragment key="departure-leg">
-              {renderRouteLegCard(routePlan.legs[0], departureStop, stops[0], "出", "1")}
+              {renderRouteLegCard(routePlan.legs[0], departureStop, stops[0], "出", stopSequenceLabel(stops[0], 0))}
             </Fragment>
           )}
           {stops.map((stop, index) => {
@@ -2543,10 +2833,12 @@ export default function App() {
             const routeLeg = routePlan?.legs[departureStop ? index + 1 : index];
             const nextStop = stops[index + 1];
             const RouteSummaryIcon = routeLeg?.mode === "WALK" ? Footprints : TrainFront;
+            const role = getStopRole(stop);
+            const stopIndexLabel = stopSequenceLabel(stop, index);
             return (
               <Fragment key={stop.id}>
                 <div
-                  className={`stop-card ${selected ? "is-selected" : ""}`}
+                  className={`stop-card ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""} ${item.isLate ? "is-late" : ""}`}
                   draggable
                   onMouseEnter={() => setPreviewStopId(stop.id)}
                   onMouseLeave={() => setPreviewStopId((current) => (current === stop.id ? null : current))}
@@ -2560,7 +2852,7 @@ export default function App() {
                   <div className="drag-handle" title="拖动排序" aria-label="拖动排序">
                     <GripVertical size={16} />
                   </div>
-                  <div className="stop-index">{index + 1}</div>
+                  <div className="stop-index">{stopIndexLabel}</div>
                   <div className="stop-body">
                     <input
                       className="stop-title"
@@ -2575,11 +2867,44 @@ export default function App() {
                       rows={2}
                       onChange={(event) => updateStop(stop.id, { note: event.target.value })}
                     />
+                    <div className="stop-controls">
+                      <label className="compact-field">
+                        <span>类型</span>
+                        <select value={role} onChange={(event) => updateStopRole(stop.id, event.target.value as StopRole)}>
+                          <option value="normal">巡礼</option>
+                          <option value="fixed">定点</option>
+                          <option value="end">终点</option>
+                        </select>
+                      </label>
+                      {role === "fixed" && (
+                        <div className="time-window-fields">
+                          <label className="compact-field">
+                            <span>开始</span>
+                            <input
+                              type="time"
+                              value={stop.windowStart || ""}
+                              onChange={(event) => updateStop(stop.id, { windowStart: event.target.value }, true)}
+                            />
+                          </label>
+                          <label className="compact-field">
+                            <span>结束</span>
+                            <input
+                              type="time"
+                              value={stop.windowEnd || ""}
+                              onChange={(event) => updateStop(stop.id, { windowEnd: event.target.value }, true)}
+                            />
+                          </label>
+                        </div>
+                      )}
+                    </div>
                     <div className="stop-meta">
                       <span>
                         <Clock3 size={14} />
-                        {formatClock(item.arrival)} - {formatClock(item.departure)}
+                        {isEndpointStop(stop) ? `到达 ${formatClock(item.arrival)}` : `${formatClock(item.visitStart)} - ${formatClock(item.departure)}`}
                       </span>
+                      <span>{stopRoleLabel(stop)}{isEndpointStop(stop) ? "" : ` ${stopVisitMinutes(stop)} 分钟`}</span>
+                      {item.waitMinutes > 0 && <span>等待 {item.waitMinutes} 分钟</span>}
+                      {item.isLate && <span className="is-late-badge">定点可能迟到</span>}
                       {index < stops.length - 1 && (
                         <span>
                           <Navigation size={14} />
@@ -2595,17 +2920,10 @@ export default function App() {
                       {stop.source?.startsWith("Anitabi") && <span>{stop.source}</span>}
                     </div>
                   </div>
-                  <label className="stay-field" title="停留分钟">
-                    <input
-                      type="number"
-                      min={0}
-                      max={600}
-                      step={5}
-                      value={stop.stayMinutes}
-                      onChange={(event) => updateStop(stop.id, { stayMinutes: Number(event.target.value) || 0 })}
-                    />
-                    <span>分</span>
-                  </label>
+                  <div className="stay-field" title={isEndpointStop(stop) ? "终点不设置停留时间" : "巡礼时间固定 5 分钟"}>
+                    <strong>{isEndpointStop(stop) ? "终" : stopVisitMinutes(stop)}</strong>
+                    {!isEndpointStop(stop) && <span>分</span>}
+                  </div>
                   <button className="icon-button danger" type="button" title="删除地点" aria-label="删除地点" onClick={() => removeStop(stop.id)}>
                     <Trash2 size={17} />
                   </button>
@@ -2620,7 +2938,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                {nextStop && routeLeg && renderRouteLegCard(routeLeg, stop, nextStop, String(index + 1), String(index + 2))}
+                {nextStop && routeLeg && renderRouteLegCard(routeLeg, stop, nextStop, stopSequenceLabel(stop, index), stopSequenceLabel(nextStop, index + 1))}
               </Fragment>
             );
           })}
@@ -2690,3 +3008,4 @@ export default function App() {
     </main>
   );
 }
+

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import express from "express";
 import { neon } from "@neondatabase/serverless";
 import fs from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -103,17 +104,25 @@ function cleanText(value, fallback, maxLength = 240) {
   return (text || fallback).slice(0, maxLength);
 }
 
+function cleanClock(value) {
+  if (typeof value !== "string") return undefined;
+  return /^\d{2}:\d{2}$/.test(value) ? value : undefined;
+}
+
 function normalizeStoredStop(value) {
   const lat = Number(value?.location?.lat);
   const lng = Number(value?.location?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const stayMinutes = Number(value?.stayMinutes);
+  const role = value?.role === "fixed" || value?.role === "end" ? value.role : "normal";
   return {
     ...value,
     id: cleanText(value?.id, randomUUID(), 120),
     name: cleanText(value?.name, "未命名地点", 180),
     location: { lat, lng },
-    stayMinutes: Number.isFinite(stayMinutes) ? Math.max(0, Math.min(1440, stayMinutes)) : 45
+    role,
+    windowStart: role === "fixed" ? cleanClock(value?.windowStart) : undefined,
+    windowEnd: role === "fixed" ? cleanClock(value?.windowEnd) : undefined,
+    stayMinutes: role === "end" ? 0 : 5
   };
 }
 
@@ -140,6 +149,7 @@ function normalizeStoredPlan(value, idOverride) {
     name: cleanText(value?.name, `${tripDate} 一日规划`, 180),
     tripDate,
     startTime: typeof value?.startTime === "string" && /^\d{2}:\d{2}$/.test(value.startTime) ? value.startTime : "09:00",
+    departureEndTime: cleanClock(value?.departureEndTime) || cleanClock(value?.startTime) || "09:00",
     departureStop: normalizeStoredStop(value?.departureStop),
     transitTimePreference: value?.transitTimePreference === "arrival" ? "arrival" : "departure",
     stops,
@@ -1504,8 +1514,8 @@ app.get("/api/anitabi/bangumi/:subjectId/lite", async (req, res) => {
   }
 });
 
-app.get("/api/anitabi/bangumi/:subjectId/detail", async (req, res) => {
-  const subjectId = String(req.params.subjectId || "").trim();
+async function sendAnitabiDetailResponse(subjectIdInput, res) {
+  const subjectId = String(subjectIdInput || "").trim();
   if (!/^\d+$/.test(subjectId)) {
     return res.status(400).json({ error: "Bangumi subject ID must be numeric." });
   }
@@ -1544,9 +1554,19 @@ app.get("/api/anitabi/bangumi/:subjectId/detail", async (req, res) => {
       error: error instanceof Error ? error.message : "Unknown Anitabi detail import error."
     });
   }
+}
+
+app.get("/api/anitabi/detail", async (req, res) => {
+  return sendAnitabiDetailResponse(req.query.subjectId || req.query.id, res);
+});
+
+app.get("/api/anitabi/bangumi/:subjectId/detail", async (req, res) => {
+  return sendAnitabiDetailResponse(req.params.subjectId, res);
 });
 
 if (!isVercel) {
+  const server = createHttpServer(app);
+
   if (isProduction) {
     const distPath = path.resolve(__dirname, "dist");
     app.use(express.static(distPath));
@@ -1556,13 +1576,13 @@ if (!isVercel) {
   } else {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: { server } },
       appType: "spa"
     });
     app.use(vite.middlewares);
   }
 
-  const server = app.listen(port, () => {
+  server.listen(port, () => {
     const mode = isProduction ? "production" : "development";
     const envPath = path.join(__dirname, ".env");
     const envHint = fs.existsSync(envPath) ? "" : " - copy .env.example to .env to enable Google services";
