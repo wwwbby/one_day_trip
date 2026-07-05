@@ -816,6 +816,7 @@ export default function App() {
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
   const [isRouting, setIsRouting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [isSearchingDeparture, setIsSearchingDeparture] = useState(false);
   const [isSearchingAnitabi, setIsSearchingAnitabi] = useState(false);
   const [isImportingAnitabi, setIsImportingAnitabi] = useState(false);
   const [anitabiQuery, setAnitabiQuery] = useState("");
@@ -1729,7 +1730,7 @@ export default function App() {
       return;
     }
 
-    setIsSearching(true);
+    setIsSearchingDeparture(true);
     try {
       const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
       const data = await readApiJson(response, "出发点搜索失败。");
@@ -1741,9 +1742,47 @@ export default function App() {
     } catch (error) {
       setToast(error instanceof Error ? error.message : "出发点搜索失败。");
     } finally {
-      setIsSearching(false);
+      setIsSearchingDeparture(false);
     }
   }, [departureQuery, setDepartureFromResult]);
+
+  useEffect(() => {
+    if (!activePlanId) return undefined;
+
+    const query = departureQuery.trim();
+    if (query.length < 2 || query === departureStop?.name || tryParseCoordinates(query)) {
+      setDepartureResults([]);
+      setIsSearchingDeparture(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setIsSearchingDeparture(true);
+      try {
+        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        const data = await readApiJson(response, "出发点搜索失败。");
+        if (!cancelled) {
+          setDepartureResults(Array.isArray(data) ? data : []);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Departure autocomplete failed", error);
+          setDepartureResults([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSearchingDeparture(false);
+        }
+      }
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      setIsSearchingDeparture(false);
+    };
+  }, [activePlanId, departureQuery, departureStop?.name]);
 
   const calculateRoute = useCallback(
     async () => {
@@ -2292,9 +2331,14 @@ export default function App() {
                 }
               }}
             />
-            <button className="secondary-button" type="button" disabled={isSearching} onClick={searchDeparturePoint}>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={isSearchingDeparture}
+              onClick={searchDeparturePoint}
+            >
               <LocateFixed size={17} />
-              设置起点
+              {isSearchingDeparture ? "搜索中" : "设置起点"}
             </button>
           </div>
           {departureResults.length > 0 && (
