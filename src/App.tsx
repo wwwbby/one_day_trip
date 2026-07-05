@@ -137,7 +137,8 @@ const googleMapId = (import.meta.env.VITE_GOOGLE_MAP_ID as string | undefined) |
 const defaultCenter = { lat: 34.985849, lng: 135.758766 };
 const autoTransitThresholdMeters = 1000;
 const routeRequestQuotaPerMinute = 50;
-const planStorageKey = "daytrip-planner.plans.v1";
+const planCacheStorageKey = "daytrip-planner.plans.v1";
+const planServerMigrationKey = "daytrip-planner.server-migrated.v1";
 
 const initialStops = (): Stop[] => [
   {
@@ -297,9 +298,9 @@ function normalizeDayPlan(value: any): DayPlan | null {
   });
 }
 
-function loadStoredPlans() {
+function loadLocalCachedPlans() {
   if (typeof window === "undefined") return defaultDayPlans();
-  const stored = window.localStorage.getItem(planStorageKey);
+  const stored = window.localStorage.getItem(planCacheStorageKey);
   if (!stored) return defaultDayPlans();
 
   try {
@@ -307,8 +308,55 @@ function loadStoredPlans() {
     if (!Array.isArray(parsed)) return defaultDayPlans();
     return parsed.map(normalizeDayPlan).filter(Boolean) as DayPlan[];
   } catch (error) {
-    console.error("Failed to load stored plans", error);
+    console.error("Failed to load cached plans", error);
     return defaultDayPlans();
+  }
+}
+
+async function readPlansFromServer() {
+  const response = await fetch("/api/plans");
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || "服务端规划读取失败。");
+  }
+  return Array.isArray(data?.plans)
+    ? (data.plans.map(normalizeDayPlan).filter(Boolean) as DayPlan[])
+    : [];
+}
+
+async function writePlanToServer(plan: DayPlan) {
+  const response = await fetch(`/api/plans/${encodeURIComponent(plan.id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan })
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || "规划保存到服务端失败。");
+  }
+  return normalizeDayPlan(data?.plan) || plan;
+}
+
+async function createPlanOnServer(plan: DayPlan) {
+  const response = await fetch("/api/plans", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan })
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || "规划创建到服务端失败。");
+  }
+  return normalizeDayPlan(data?.plan) || plan;
+}
+
+async function deletePlanFromServer(id: string) {
+  const response = await fetch(`/api/plans/${encodeURIComponent(id)}`, {
+    method: "DELETE"
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error || "服务端规划删除失败。");
   }
 }
 
@@ -700,12 +748,14 @@ function loadGoogleMaps(apiKey: string) {
 }
 
 export default function App() {
-  const [plans, setPlans] = useState<DayPlan[]>(loadStoredPlans);
+  const [plans, setPlans] = useState<DayPlan[]>(loadLocalCachedPlans);
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
   const [planName, setPlanName] = useState("");
   const [newPlanName, setNewPlanName] = useState("");
   const [newPlanDate, setNewPlanDate] = useState(todayInputValue);
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
+  const [isLoadingPlans, setIsLoadingPlans] = useState(true);
+  const [planSyncMode, setPlanSyncMode] = useState<"server" | "local">("local");
   const [stops, setStops] = useState<Stop[]>([]);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   const [tripDate, setTripDate] = useState(todayInputValue);
@@ -739,6 +789,15 @@ export default function App() {
   const leafletMarkersRef = useRef<L.Marker[]>([]);
   const leafletPolylineRef = useRef<L.Polyline | null>(null);
   const selectionStartRef = useRef<MapPoint | null>(null);
+  const plansRef = useRef<DayPlan[]>(plans);
+
+  const persistPlanToServer = useCallback(
+    async (plan: DayPlan) => {
+      if (planSyncMode !== "server") return plan;
+      return writePlanToServer(plan);
+    },
+    [planSyncMode]
+  );
 
   const sortedPlans = useMemo(
     () =>
@@ -779,7 +838,7 @@ export default function App() {
     [loadPlanIntoEditor, plans]
   );
 
-  const createPlan = useCallback(() => {
+  const createPlan = useCallback(async () => {
     const plan = createDayPlan({
       name: newPlanName,
       tripDate: newPlanDate,
@@ -788,13 +847,29 @@ export default function App() {
     setPlans((current) => [plan, ...current]);
     setNewPlanName("");
     loadPlanIntoEditor(plan);
-    setToast("已创建新的一日规划。");
-  }, [loadPlanIntoEditor, newPlanDate, newPlanName]);
+    try {
+      const savedPlan = planSyncMode === "server" ? await createPlanOnServer(plan) : plan;
+      setPlans((current) => current.map((item) => (item.id === plan.id ? savedPlan : item)));
+      loadPlanIntoEditor(savedPlan);
+      setToast(planSyncMode === "server" ? "已创建并同步到服务端。" : "已创建新的一日规划。");
+    } catch (error) {
+      setToast(error instanceof Error ? `${error.message} 已先保存在本地缓存。` : "规划创建到服务端失败，已先保存在本地缓存。");
+    }
+  }, [loadPlanIntoEditor, newPlanDate, newPlanName, planSyncMode]);
 
-  const deletePlan = useCallback((id: string) => {
+  const deletePlan = useCallback(async (id: string) => {
+    const previousPlans = plans;
     setPlans((current) => current.filter((plan) => plan.id !== id));
-    setToast("规划已删除。");
-  }, []);
+    try {
+      if (planSyncMode === "server") {
+        await deletePlanFromServer(id);
+      }
+      setToast("规划已删除。");
+    } catch (error) {
+      setPlans(previousPlans);
+      setToast(error instanceof Error ? error.message : "服务端规划删除失败。");
+    }
+  }, [planSyncMode, plans]);
 
   const renamePlan = useCallback((id: string, name: string) => {
     setPlans((current) =>
@@ -810,36 +885,60 @@ export default function App() {
     );
   }, []);
 
+  const persistListedPlan = useCallback(
+    async (id: string) => {
+      const plan = plans.find((item) => item.id === id);
+      if (!plan) return;
+      try {
+        await persistPlanToServer(plan);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "规划保存到服务端失败。");
+      }
+    },
+    [persistPlanToServer, plans]
+  );
+
   const saveActivePlan = useCallback(
-    (showToast = false) => {
+    async (showToast = false) => {
       if (!activePlanId) return;
       const savedAt = new Date().toISOString();
+      const nextPlan = {
+        id: activePlanId,
+        name: planName.trim() || defaultPlanName(tripDate),
+        tripDate,
+        startTime,
+        transitTimePreference,
+        stops: clonePlain(stops),
+        routePlan: clonePlain(routePlan),
+        createdAt: plansRef.current.find((plan) => plan.id === activePlanId)?.createdAt || savedAt,
+        updatedAt: savedAt
+      };
       setPlans((current) =>
         current.map((plan) =>
           plan.id === activePlanId
-            ? {
-                ...plan,
-                name: planName.trim() || defaultPlanName(tripDate),
-                tripDate,
-                startTime,
-                transitTimePreference,
-                stops: clonePlain(stops),
-                routePlan: clonePlain(routePlan),
-                updatedAt: savedAt
-              }
+            ? nextPlan
             : plan
         )
       );
       setLastSavedAt(savedAt);
-      if (showToast) {
-        setToast("规划已保存。");
+      try {
+        const savedPlan = await persistPlanToServer(nextPlan);
+        setPlans((current) => current.map((plan) => (plan.id === activePlanId ? savedPlan : plan)));
+        setLastSavedAt(savedPlan.updatedAt);
+        if (showToast) {
+          setToast(planSyncMode === "server" ? "规划已保存到服务端。" : "规划已保存。");
+        }
+      } catch (error) {
+        if (showToast) {
+          setToast(error instanceof Error ? `${error.message} 已先保存在本地缓存。` : "服务端保存失败，已先保存在本地缓存。");
+        }
       }
     },
-    [activePlanId, planName, routePlan, startTime, stops, transitTimePreference, tripDate]
+    [activePlanId, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, transitTimePreference, tripDate]
   );
 
   const backToPlanList = useCallback(() => {
-    saveActivePlan(false);
+    void saveActivePlan(false);
     setActivePlanId(null);
     setSelectedStopId(null);
     setSelectedStopIds([]);
@@ -1097,8 +1196,54 @@ export default function App() {
   }, [toast]);
 
   useEffect(() => {
+    plansRef.current = plans;
+  }, [plans]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadServerPlans() {
+      const localPlans = loadLocalCachedPlans();
+      try {
+        let serverPlans = await readPlansFromServer();
+        const alreadyMigrated = window.localStorage.getItem(planServerMigrationKey) === "1";
+        if (!serverPlans.length && localPlans.length && !alreadyMigrated) {
+          const uploadedPlans: DayPlan[] = [];
+          for (const localPlan of localPlans) {
+            uploadedPlans.push(await createPlanOnServer(localPlan));
+          }
+          serverPlans = uploadedPlans;
+          window.localStorage.setItem(planServerMigrationKey, "1");
+          if (!cancelled) {
+            setToast("已将本地规划同步到服务端。");
+          }
+        }
+
+        if (cancelled) return;
+        setPlans(serverPlans);
+        setPlanSyncMode("server");
+      } catch (error) {
+        if (!cancelled) {
+          setPlans(localPlans);
+          setPlanSyncMode("local");
+          setToast(error instanceof Error ? `${error.message} 暂时使用本地缓存。` : "服务端规划读取失败，暂时使用本地缓存。");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingPlans(false);
+        }
+      }
+    }
+
+    void loadServerPlans();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     try {
-      window.localStorage.setItem(planStorageKey, JSON.stringify(plans));
+      window.localStorage.setItem(planCacheStorageKey, JSON.stringify(plans));
     } catch (error) {
       console.error("Failed to persist plans", error);
     }
@@ -1106,7 +1251,9 @@ export default function App() {
 
   useEffect(() => {
     if (!activePlanId) return undefined;
-    const timer = window.setTimeout(() => saveActivePlan(false), 650);
+    const timer = window.setTimeout(() => {
+      void saveActivePlan(false);
+    }, 650);
     return () => window.clearTimeout(timer);
   }, [activePlanId, planName, routePlan, saveActivePlan, startTime, stops, transitTimePreference, tripDate]);
 
@@ -1726,7 +1873,11 @@ export default function App() {
               <p className="eyebrow">Daytrip Planner</p>
               <h1>一日规划</h1>
             </div>
-            <span>{plans.length} 个规划</span>
+            <span>
+              {isLoadingPlans
+                ? "同步中"
+                : `${plans.length} 个规划 · ${planSyncMode === "server" ? "服务端同步" : "本地缓存"}`}
+            </span>
           </header>
 
           <div className="new-plan-panel">
@@ -1742,12 +1893,12 @@ export default function App() {
                 onChange={(event) => setNewPlanName(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
-                    createPlan();
+                    void createPlan();
                   }
                 }}
               />
             </label>
-            <button className="primary-button" type="button" onClick={createPlan}>
+            <button className="primary-button" type="button" onClick={() => void createPlan()}>
               <Plus size={18} />
               新建规划
             </button>
@@ -1769,7 +1920,7 @@ export default function App() {
                         type="button"
                         title="删除规划"
                         aria-label="删除规划"
-                        onClick={() => deletePlan(plan.id)}
+                        onClick={() => void deletePlan(plan.id)}
                       >
                         <Trash2 size={17} />
                       </button>
@@ -1779,6 +1930,12 @@ export default function App() {
                       value={plan.name}
                       aria-label="规划名称"
                       onChange={(event) => renamePlan(plan.id, event.target.value)}
+                      onBlur={() => void persistListedPlan(plan.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.currentTarget.blur();
+                        }
+                      }}
                     />
                     <div className="plan-card-stats">
                       <span>{plan.stops.length} 个地点</span>
@@ -1826,7 +1983,7 @@ export default function App() {
             <button className="icon-button subtle" type="button" title="返回规划列表" aria-label="返回规划列表" onClick={backToPlanList}>
               <ArrowLeft size={18} />
             </button>
-            <button className="icon-button subtle" type="button" title="保存规划" aria-label="保存规划" onClick={() => saveActivePlan(true)}>
+            <button className="icon-button subtle" type="button" title="保存规划" aria-label="保存规划" onClick={() => void saveActivePlan(true)}>
               <Save size={18} />
             </button>
             <button className="icon-button subtle" type="button" title="清空地点" aria-label="清空地点" onClick={clearTrip}>

@@ -9,7 +9,8 @@
 - Google Places Autocomplete 地点搜索
 - 免费模式下使用 Nominatim 地点搜索
 - 首页展示多个一日规划，可创建、命名、删除并进入单日编辑
-- 规划会保存到浏览器本地 `localStorage`，刷新或下次打开仍可继续编辑
+- 规划可保存到服务端 Postgres/Neon，电脑和手机访问同一部署域名可看到同一份计划
+- 本地开发没有数据库时自动使用 `.data/daytrip-plans.json` 兜底，浏览器 `localStorage` 只作为缓存和旧数据迁移来源
 - 点击地图添加自定义地点
 - 粘贴坐标或 Google Maps 链接添加地点
 - 地点列表拖拽排序
@@ -54,6 +55,7 @@ GOOGLE_MAPS_SERVER_KEY=your_server_restricted_routes_api_key
 NAVITIME_RAPIDAPI_KEY=your_navitime_route_totalnavi_rapidapi_key
 NAVITIME_RAPIDAPI_HOST=navitime-route-totalnavi.p.rapidapi.com
 TRANSITOUS_USER_AGENT=DaytripPlanner/0.1 contact=your-email@example.com
+DATABASE_URL=postgresql://user:password@host/db?sslmode=require
 PORT=5173
 ```
 
@@ -91,7 +93,7 @@ vercel.json         Vercel 构建、静态输出、函数超时配置
 .env.example        Google Maps 配置模板
 ```
 
-当前持久化是浏览器本地存储，适合单机原型。换浏览器、清理站点数据或换设备后不会自动同步；如果要做多用户正式产品，下一步应接 PostgreSQL/PostGIS 或云数据库。
+当前持久化优先使用 `DATABASE_URL` 指向的 Postgres/Neon，并自动创建 `daytrip_plans` 表。Vercel 上要实现手机/电脑同步必须配置 `DATABASE_URL`；本地没配数据库时才会写 `.data/daytrip-plans.json`。
 
 ## Vercel 部署
 
@@ -99,8 +101,7 @@ vercel.json         Vercel 构建、静态输出、函数超时配置
 
 ## 后续方向
 
-- 多设备同步到 PostgreSQL + PostGIS
-- 多用户分享链接和协作编辑
+- 用户登录、分享链接和协作编辑
 - KMZ 导入
 - Anitabi 详情点位和截图来源展示
 - 营业时间、预约时间、午餐/晚餐、预算约束

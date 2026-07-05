@@ -1,7 +1,9 @@
 import dotenv from "dotenv";
 import express from "express";
+import { neon } from "@neondatabase/serverless";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 dotenv.config();
@@ -12,7 +14,7 @@ const isVercel = process.env.VERCEL === "1";
 const port = Number(process.env.PORT || 5173);
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 const travelModeAllowlist = new Set([
   "DRIVE",
@@ -37,7 +39,10 @@ const navitimeMinRequestIntervalMs = Math.ceil(60000 / navitimeRequestsPerMinute
 const navitimeRapidApiKey = process.env.NAVITIME_RAPIDAPI_KEY || "";
 const navitimeRapidApiHost =
   process.env.NAVITIME_RAPIDAPI_HOST || "navitime-route-totalnavi.p.rapidapi.com";
+const plansFilePath = path.join(__dirname, ".data", "daytrip-plans.json");
 let nextNavitimeRequestAt = 0;
+let sqlClient = null;
+let plansTableReadyPromise = null;
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -52,6 +57,168 @@ async function waitForNavitimeRateLimit() {
   if (waitMs > 0) {
     await sleep(waitMs);
   }
+}
+
+function getSqlClient() {
+  if (!process.env.DATABASE_URL) return null;
+  if (!sqlClient) {
+    sqlClient = neon(process.env.DATABASE_URL);
+  }
+  return sqlClient;
+}
+
+async function ensurePlansTable() {
+  const sql = getSqlClient();
+  if (!sql) return null;
+  if (!plansTableReadyPromise) {
+    plansTableReadyPromise = sql`
+      create table if not exists daytrip_plans (
+        id text primary key,
+        data jsonb not null,
+        created_at timestamptz not null,
+        updated_at timestamptz not null
+      )
+    `;
+  }
+  await plansTableReadyPromise;
+  return sql;
+}
+
+function validIsoDate(value, fallback = new Date().toISOString()) {
+  if (typeof value !== "string") return fallback;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? fallback : value;
+}
+
+function validTripDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? value
+    : new Date().toISOString().slice(0, 10);
+}
+
+function cleanText(value, fallback, maxLength = 240) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return (text || fallback).slice(0, maxLength);
+}
+
+function normalizeStoredStop(value) {
+  const lat = Number(value?.location?.lat);
+  const lng = Number(value?.location?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const stayMinutes = Number(value?.stayMinutes);
+  return {
+    ...value,
+    id: cleanText(value?.id, randomUUID(), 120),
+    name: cleanText(value?.name, "未命名地点", 180),
+    location: { lat, lng },
+    stayMinutes: Number.isFinite(stayMinutes) ? Math.max(0, Math.min(1440, stayMinutes)) : 45
+  };
+}
+
+function normalizeStoredPlan(value, idOverride) {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      value = {};
+    }
+  }
+  const now = new Date().toISOString();
+  const tripDate = validTripDate(value?.tripDate);
+  const stops = Array.isArray(value?.stops)
+    ? value.stops.map(normalizeStoredStop).filter(Boolean)
+    : [];
+  const routePlan =
+    value?.routePlan && typeof value.routePlan === "object" && Array.isArray(value.routePlan.legs)
+      ? value.routePlan
+      : null;
+
+  return {
+    id: cleanText(idOverride || value?.id, randomUUID(), 120),
+    name: cleanText(value?.name, `${tripDate} 一日规划`, 180),
+    tripDate,
+    startTime: typeof value?.startTime === "string" && /^\d{2}:\d{2}$/.test(value.startTime) ? value.startTime : "09:00",
+    transitTimePreference: value?.transitTimePreference === "arrival" ? "arrival" : "departure",
+    stops,
+    routePlan,
+    createdAt: validIsoDate(value?.createdAt, now),
+    updatedAt: validIsoDate(value?.updatedAt, now)
+  };
+}
+
+async function readPlansFromFile() {
+  try {
+    const content = await fs.promises.readFile(plansFilePath, "utf8");
+    const parsed = JSON.parse(content);
+    return Array.isArray(parsed) ? parsed.map((plan) => normalizeStoredPlan(plan)).filter(Boolean) : [];
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function writePlansToFile(plans) {
+  await fs.promises.mkdir(path.dirname(plansFilePath), { recursive: true });
+  await fs.promises.writeFile(plansFilePath, JSON.stringify(plans, null, 2), "utf8");
+}
+
+async function listStoredPlans() {
+  const sql = await ensurePlansTable();
+  if (sql) {
+    const rows = await sql`
+      select data
+      from daytrip_plans
+      order by data->>'tripDate' asc, updated_at desc
+    `;
+    return rows.map((row) => normalizeStoredPlan(row.data)).filter(Boolean);
+  }
+  if (isVercel) {
+    const error = new Error("DATABASE_URL is required for server-side plan persistence on Vercel.");
+    error.status = 500;
+    throw error;
+  }
+  return readPlansFromFile();
+}
+
+async function upsertStoredPlan(input, idOverride) {
+  const plan = normalizeStoredPlan(input, idOverride);
+  const sql = await ensurePlansTable();
+  if (sql) {
+    await sql`
+      insert into daytrip_plans (id, data, created_at, updated_at)
+      values (${plan.id}, ${JSON.stringify(plan)}::jsonb, ${plan.createdAt}::timestamptz, ${plan.updatedAt}::timestamptz)
+      on conflict (id) do update
+      set data = excluded.data,
+          updated_at = excluded.updated_at
+    `;
+    return plan;
+  }
+  if (isVercel) {
+    const error = new Error("DATABASE_URL is required for server-side plan persistence on Vercel.");
+    error.status = 500;
+    throw error;
+  }
+  const plans = await readPlansFromFile();
+  const next = [plan, ...plans.filter((item) => item.id !== plan.id)];
+  await writePlansToFile(next);
+  return plan;
+}
+
+async function deleteStoredPlan(id) {
+  const cleanId = cleanText(id, "", 120);
+  if (!cleanId) return;
+  const sql = await ensurePlansTable();
+  if (sql) {
+    await sql`delete from daytrip_plans where id = ${cleanId}`;
+    return;
+  }
+  if (isVercel) {
+    const error = new Error("DATABASE_URL is required for server-side plan persistence on Vercel.");
+    error.status = 500;
+    throw error;
+  }
+  const plans = await readPlansFromFile();
+  await writePlansToFile(plans.filter((plan) => plan.id !== cleanId));
 }
 
 function asWaypoint(stop) {
@@ -736,6 +903,50 @@ app.get("/api/search", async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       error: error instanceof Error ? error.message : "Unknown search error."
+    });
+  }
+});
+
+app.get("/api/plans", async (_req, res) => {
+  try {
+    const plans = await listStoredPlans();
+    return res.json({ plans });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Failed to load plans."
+    });
+  }
+});
+
+app.post("/api/plans", async (req, res) => {
+  try {
+    const plan = await upsertStoredPlan(req.body?.plan || req.body || {});
+    return res.status(201).json({ plan });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Failed to save plan."
+    });
+  }
+});
+
+app.put("/api/plans/:id", async (req, res) => {
+  try {
+    const plan = await upsertStoredPlan(req.body?.plan || req.body || {}, req.params.id);
+    return res.json({ plan });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Failed to save plan."
+    });
+  }
+});
+
+app.delete("/api/plans/:id", async (req, res) => {
+  try {
+    await deleteStoredPlan(req.params.id);
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      error: error instanceof Error ? error.message : "Failed to delete plan."
     });
   }
 });
