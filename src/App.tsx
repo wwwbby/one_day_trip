@@ -6,6 +6,7 @@ import {
   Download,
   Footprints,
   GripVertical,
+  Image as ImageIcon,
   LocateFixed,
   MapPin,
   Navigation,
@@ -24,7 +25,7 @@ import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, PointerEvent, useCallb
 
 type MapProvider = "google" | "osm";
 type TransitTimePreference = "departure" | "arrival";
-type StopRole = "normal" | "fixed" | "end";
+type StopRole = "normal" | "pilgrimage" | "fixed" | "end";
 
 declare global {
   interface Window {
@@ -44,6 +45,8 @@ type Stop = {
   };
   stayMinutes: number;
   role?: StopRole;
+  isStart?: boolean;
+  isEnd?: boolean;
   windowStart?: string;
   windowEnd?: string;
   note?: string;
@@ -92,6 +95,7 @@ type RoutePlan = {
   encodedPolyline?: string;
   coordinates?: Array<[number, number]>;
   legs: RouteLeg[];
+  routeStopIds?: string[];
   optimizedIntermediateWaypointIndex?: number[];
   provider?: string;
 };
@@ -141,6 +145,17 @@ type ScheduleItem = {
   travelToNextMinutes: number;
 };
 
+type RouteOrderSimulation = {
+  score: number;
+  endMinutes: number;
+  totalTravelMinutes: number;
+  totalWaitMinutes: number;
+  totalLatenessMinutes: number;
+  bufferShortfallMinutes: number;
+  missedFixedCount: number;
+  distanceMeters: number;
+};
+
 type MapPoint = {
   x: number;
   y: number;
@@ -159,6 +174,9 @@ const defaultCenter = { lat: 34.985849, lng: 135.758766 };
 const pilgrimageStayMinutes = 5;
 const autoTransitThresholdMeters = 1000;
 const routeRequestQuotaPerMinute = 50;
+const fixedArrivalBufferMinutes = 8;
+const maxInsertionCandidatesPerRound = 32;
+const maxRelocationOptimizationStops = 72;
 const planCacheStorageKey = "daytrip-planner.plans.v1";
 const planServerMigrationKey = "daytrip-planner.server-migrated.v1";
 const newPlanDraftStorageKey = "daytrip-planner.new-plan-draft.v1";
@@ -308,8 +326,7 @@ function defaultDayPlans() {
     createDayPlan({
       name: `${formatPlanDate(firstDate)} 京都巡礼`,
       tripDate: firstDate,
-      departureStop: sampleStops[0],
-      stops: sampleStops.slice(1)
+      stops: [{ ...sampleStops[0], isStart: true }, ...sampleStops.slice(1)]
     }),
     createDayPlan({
       name: `${formatPlanDate(secondDate)} 一日规划`,
@@ -319,22 +336,48 @@ function defaultDayPlans() {
   ];
 }
 
+function isAnitabiStopLike(value: any) {
+  return Boolean(
+    value?.anitabiPointId ||
+    value?.workTitle ||
+    (typeof value?.source === "string" && value.source.startsWith("Anitabi"))
+  );
+}
+
 function normalizeStop(value: any): Stop | null {
   const lat = Number(value?.location?.lat);
   const lng = Number(value?.location?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const role: StopRole = value?.role === "fixed" || value?.role === "end" ? value.role : "normal";
-  const windowStart = role === "fixed" ? normalizeClockValue(value?.windowStart) : undefined;
-  const windowEnd = role === "fixed" ? normalizeClockValue(value?.windowEnd) : undefined;
+  const legacyEnd = value?.role === "end";
+  const isStart = Boolean(value?.isStart);
+  const rawRole = value?.role;
+  const role: StopRole =
+    rawRole === "fixed" || rawRole === "pilgrimage"
+      ? rawRole
+      : rawRole === "special"
+        ? "pilgrimage"
+        : isAnitabiStopLike(value)
+          ? "pilgrimage"
+          : "normal";
+  const isEnd = (Boolean(value?.isEnd) || legacyEnd) && !isStart;
+  const windowStart = role === "fixed"
+    ? normalizeClockValue(value?.windowStart) || "12:00"
+    : isStart
+      ? normalizeClockValue(value?.windowStart)
+      : undefined;
+  const stayMinutes = normalizeStayMinutes(value?.stayMinutes, isEnd ? 0 : pilgrimageStayMinutes);
+  const windowEnd = role === "fixed" ? derivedFixedWindowEndClock(windowStart, stayMinutes) : undefined;
   return {
     ...value,
     id: String(value?.id || makeId()),
     name: String(value?.name || "未命名地点"),
     location: { lat, lng },
     role,
+    isStart,
+    isEnd,
     windowStart,
     windowEnd,
-    stayMinutes: role === "end" ? 0 : pilgrimageStayMinutes
+    stayMinutes
   };
 }
 
@@ -344,6 +387,23 @@ function normalizeDayPlan(value: any): DayPlan | null {
   const stops = Array.isArray(value.stops)
     ? (value.stops.map(normalizeStop).filter(Boolean) as Stop[])
     : [];
+  const legacyDepartureStop = normalizeStop(value.departureStop);
+  const legacyStartTime = normalizeClockValue(value.startTime) || "09:00";
+  const legacyDepartureEndTime = normalizeClockValue(value.departureEndTime) || legacyStartTime;
+  const legacyDepartureStay = clockDiffMinutes(legacyStartTime, legacyDepartureEndTime);
+  const mergedStops = legacyDepartureStop
+    ? [
+        {
+          ...legacyDepartureStop,
+          isStart: true,
+          role: (legacyDepartureStop.role === "fixed" ? "fixed" : "normal") as StopRole,
+          windowStart: legacyDepartureStop.windowStart || legacyStartTime,
+          windowEnd: undefined,
+          stayMinutes: legacyDepartureStay ?? stopVisitMinutes(legacyDepartureStop)
+        },
+        ...stops.filter((stop) => stop.id !== legacyDepartureStop.id)
+      ]
+    : stops;
   const routePlan =
     value.routePlan && typeof value.routePlan === "object" && Array.isArray(value.routePlan.legs)
       ? (value.routePlan as RoutePlan)
@@ -355,9 +415,9 @@ function normalizeDayPlan(value: any): DayPlan | null {
     tripDate,
     startTime: typeof value.startTime === "string" && value.startTime ? value.startTime : "09:00",
     departureEndTime: normalizeClockValue(value.departureEndTime) || normalizeClockValue(value.startTime) || "09:00",
-    departureStop: normalizeStop(value.departureStop),
+    departureStop: null,
     transitTimePreference: value.transitTimePreference === "arrival" ? "arrival" : "departure",
-    stops,
+    stops: mergedStops,
     routePlan,
     createdAt: typeof value.createdAt === "string" ? value.createdAt : undefined,
     updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined
@@ -570,16 +630,37 @@ function clockDiffMinutes(start?: string, end?: string) {
   return diff >= 0 ? diff : null;
 }
 
+function normalizeStayMinutes(value: unknown, fallback = pilgrimageStayMinutes) {
+  const minutes = Math.round(Number(value));
+  if (!Number.isFinite(minutes)) return fallback;
+  return Math.max(0, Math.min(720, minutes));
+}
+
+function derivedFixedWindowEndClock(windowStart: string | undefined, stayMinutes: number) {
+  const start = normalizeClockValue(windowStart);
+  return start ? formatClock(parseClock(start) + stayMinutes) : undefined;
+}
+
 function getStopRole(stop: Stop): StopRole {
-  return stop.role === "fixed" || stop.role === "end" ? stop.role : "normal";
+  if (stop.role === "fixed" || stop.role === "pilgrimage") return stop.role;
+  if (isAnitabiStopLike(stop)) return "pilgrimage";
+  return "normal";
+}
+
+function isStartStop(stop: Stop) {
+  return Boolean(stop.isStart);
 }
 
 function isFixedStop(stop: Stop) {
   return getStopRole(stop) === "fixed";
 }
 
+function isPilgrimageStop(stop: Stop) {
+  return getStopRole(stop) === "pilgrimage";
+}
+
 function isEndpointStop(stop: Stop) {
-  return getStopRole(stop) === "end";
+  return Boolean(stop.isEnd) || stop.role === "end";
 }
 
 function fixedWindowStartMinutes(stop: Stop) {
@@ -587,7 +668,8 @@ function fixedWindowStartMinutes(stop: Stop) {
 }
 
 function fixedWindowEndMinutes(stop: Stop) {
-  return isFixedStop(stop) && normalizeClockValue(stop.windowEnd) ? parseClock(stop.windowEnd) : null;
+  const start = fixedWindowStartMinutes(stop);
+  return start === null ? null : start + stopVisitMinutes(stop);
 }
 
 function fixedArrivalDeadlineMinutes(stop: Stop) {
@@ -595,34 +677,41 @@ function fixedArrivalDeadlineMinutes(stop: Stop) {
 }
 
 function stopVisitMinutes(stop: Stop) {
-  if (isEndpointStop(stop)) return 0;
-  if (isFixedStop(stop)) {
-    const windowDuration = clockDiffMinutes(stop.windowStart, stop.windowEnd);
-    return windowDuration !== null ? Math.max(0, windowDuration) : pilgrimageStayMinutes;
-  }
-  return pilgrimageStayMinutes;
+  return normalizeStayMinutes(stop.stayMinutes, isEndpointStop(stop) ? 0 : pilgrimageStayMinutes);
 }
 
 function normalizeStopRolePatch(stop: Stop, role: StopRole): Stop {
   if (role === "end") {
     return {
       ...stop,
-      role,
+      role: "normal",
+      isStart: false,
+      isEnd: true,
       windowStart: undefined,
       windowEnd: undefined,
-      stayMinutes: 0
+      stayMinutes: normalizeStayMinutes(stop.stayMinutes, 0)
     };
   }
 
   if (role === "fixed") {
     const start = normalizeClockValue(stop.windowStart) || "12:00";
-    const end = normalizeClockValue(stop.windowEnd) || formatClock(parseClock(start) + pilgrimageStayMinutes);
+    const stayMinutes = normalizeStayMinutes(stop.stayMinutes);
     return {
       ...stop,
       role,
       windowStart: start,
-      windowEnd: end,
-      stayMinutes: pilgrimageStayMinutes
+      windowEnd: derivedFixedWindowEndClock(start, stayMinutes),
+      stayMinutes
+    };
+  }
+
+  if (role === "pilgrimage") {
+    return {
+      ...stop,
+      role,
+      windowStart: undefined,
+      windowEnd: undefined,
+      stayMinutes: normalizeStayMinutes(stop.stayMinutes)
     };
   }
 
@@ -631,18 +720,76 @@ function normalizeStopRolePatch(stop: Stop, role: StopRole): Stop {
     role: "normal",
     windowStart: undefined,
     windowEnd: undefined,
-    stayMinutes: pilgrimageStayMinutes
+    stayMinutes: normalizeStayMinutes(stop.stayMinutes)
   };
+}
+
+type StopKindSelection = "normal" | "pilgrimage" | "departure" | "fixed" | "end";
+
+function stopKindSelection(stop: Stop): StopKindSelection {
+  if (isStartStop(stop)) return "departure";
+  if (isEndpointStop(stop)) return "end";
+  if (isFixedStop(stop)) return "fixed";
+  if (isPilgrimageStop(stop)) return "pilgrimage";
+  return "normal";
+}
+
+function stopKindClass(stop: Stop) {
+  return stopKindSelection(stop);
+}
+
+function applyStopKindSelection(stop: Stop, selection: StopKindSelection): Stop {
+  if (selection === "fixed") {
+    const fixedStop = normalizeStopRolePatch(stop, "fixed");
+    return { ...fixedStop, isStart: false, isEnd: false };
+  }
+
+  if (selection === "pilgrimage") {
+    const pilgrimageStop = normalizeStopRolePatch(stop, "pilgrimage");
+    return { ...pilgrimageStop, isStart: false, isEnd: false };
+  }
+
+  const baseStop = normalizeStopRolePatch(stop, "normal");
+  const startWindowStart = normalizeClockValue(stop.windowStart) || "09:00";
+  if (selection === "departure") {
+    return { ...baseStop, isStart: true, isEnd: false, windowStart: startWindowStart, windowEnd: undefined };
+  }
+  if (selection === "end") return { ...baseStop, isStart: false, isEnd: true, stayMinutes: normalizeStayMinutes(stop.stayMinutes, 0) };
+  return { ...baseStop, isStart: false, isEnd: false };
 }
 
 function stopRoleLabel(stop: Stop) {
   const role = getStopRole(stop);
   if (role === "fixed") return "定点";
   if (role === "end") return "终点";
-  return "巡礼";
+  return "普通点";
 }
 
 function stopSequenceLabel(stop: Stop, index: number) {
+  if (isEndpointStop(stop)) return "终";
+  if (isFixedStop(stop)) return "定";
+  return String(index + 1);
+}
+
+function stopDisplayRoleLabel(stop: Stop) {
+  const labels: string[] = [];
+  if (isStartStop(stop)) labels.push("起点");
+  if (isFixedStop(stop)) labels.push("定点");
+  if (isEndpointStop(stop)) labels.push("终点");
+  return labels.length ? labels.join("+") : "普通点";
+}
+
+function stopKindLabel(stop: Stop) {
+  const labels: string[] = [];
+  if (isStartStop(stop)) labels.push("起点");
+  if (isFixedStop(stop)) labels.push("定点");
+  if (isPilgrimageStop(stop)) labels.push("巡礼点");
+  if (isEndpointStop(stop)) labels.push("终点");
+  return labels.length ? labels.join("+") : "普通点";
+}
+
+function routeStopSequenceLabel(stop: Stop, index: number) {
+  if (isStartStop(stop)) return "起";
   if (isEndpointStop(stop)) return "终";
   if (isFixedStop(stop)) return "定";
   return String(index + 1);
@@ -658,6 +805,13 @@ function estimateTravelMinutes(a: Stop, b: Stop) {
 
 function appendBeforeEndpoint(current: Stop[], additions: Stop[]) {
   const endpoint = current.find(isEndpointStop);
+  if (endpoint && isStartStop(endpoint)) {
+    return [
+      endpoint,
+      ...additions,
+      ...current.filter((stop) => stop.id !== endpoint.id)
+    ];
+  }
   if (!endpoint) return [...current, ...additions];
   return [
     ...current.filter((stop) => !isEndpointStop(stop)),
@@ -666,10 +820,10 @@ function appendBeforeEndpoint(current: Stop[], additions: Stop[]) {
   ];
 }
 
-function buildScheduleItems(stops: Stop[], legs: RouteLeg[] | undefined, hasDepartureStop: boolean, routeDepartureTime: string) {
+function buildScheduleItems(stops: Stop[], legs: RouteLeg[] | undefined, routeDepartureTime: string) {
   let cursor = parseClock(routeDepartureTime);
   return stops.map((stop, index) => {
-    const inboundLegIndex = hasDepartureStop ? index : index - 1;
+    const inboundLegIndex = index - 1;
     if (inboundLegIndex >= 0) {
       cursor += Math.round((legs?.[inboundLegIndex]?.durationSeconds || 0) / 60);
     }
@@ -677,14 +831,12 @@ function buildScheduleItems(stops: Stop[], legs: RouteLeg[] | undefined, hasDepa
     const fixedStart = fixedWindowStartMinutes(stop);
     const fixedEnd = fixedWindowEndMinutes(stop);
     const visitStart = isFixedStop(stop) && fixedStart !== null ? Math.max(arrival, fixedStart) : arrival;
-    const departure = isEndpointStop(stop)
-      ? arrival
-      : isFixedStop(stop) && fixedEnd !== null
-        ? Math.max(visitStart, fixedEnd)
-        : visitStart + stopVisitMinutes(stop);
+    const departure = isFixedStop(stop) && fixedEnd !== null
+      ? Math.max(visitStart + stopVisitMinutes(stop), fixedEnd)
+      : visitStart + stopVisitMinutes(stop);
     const deadline = fixedArrivalDeadlineMinutes(stop);
     const isLate = isFixedStop(stop) && deadline !== null && arrival > deadline;
-    const nextLegIndex = hasDepartureStop ? index + 1 : index;
+    const nextLegIndex = index;
     const travelToNextMinutes = Math.round((legs?.[nextLegIndex]?.durationSeconds || 0) / 60);
     cursor = departure;
     return {
@@ -705,8 +857,28 @@ function stopToWaypointLabel(stop: Stop) {
 
 function anitabiImageVariant(url?: string, plan = "h360") {
   if (!url) return "";
-  if (url.includes("?plan=")) return url.replace(/\?plan=[^&]+/, `?plan=${plan}`);
-  return `${url}?plan=${plan}`;
+  try {
+    const imageUrl = new URL(url);
+    imageUrl.searchParams.set("plan", plan);
+    return imageUrl.toString();
+  } catch {
+    if (url.includes("?plan=")) return url.replace(/\?plan=[^&]+/, `?plan=${plan}`);
+    return `${url}?plan=${plan}`;
+  }
+}
+
+function anitabiOriginalImageUrl(url?: string) {
+  if (!url) return "";
+  try {
+    const imageUrl = new URL(url);
+    imageUrl.searchParams.delete("plan");
+    return imageUrl.toString();
+  } catch {
+    return url
+      .replace(/[?&]plan=[^&]+/, "")
+      .replace("?&", "?")
+      .replace(/[?&]$/, "");
+  }
 }
 
 function formatAnitabiSceneTime(seconds?: number) {
@@ -865,6 +1037,79 @@ function routeDistanceMeters(stops: Stop[]) {
   return distance;
 }
 
+function simulateStopOrder(stops: Stop[], startMinutes = parseClock("09:00")): RouteOrderSimulation {
+  let cursor = startMinutes;
+  let totalTravelMinutes = 0;
+  let totalWaitMinutes = 0;
+  let totalLatenessMinutes = 0;
+  let bufferShortfallMinutes = 0;
+  let missedFixedCount = 0;
+  let distanceMeters = 0;
+
+  for (let index = 1; index < stops.length; index += 1) {
+    const previous = stops[index - 1];
+    const stop = stops[index];
+    const travelMinutes = estimateTravelMinutes(previous, stop);
+    const legDistance = haversineMeters(previous, stop);
+    totalTravelMinutes += travelMinutes;
+    distanceMeters += legDistance;
+    cursor += travelMinutes;
+
+    if (isFixedStop(stop)) {
+      const deadline = fixedArrivalDeadlineMinutes(stop);
+      if (deadline !== null) {
+        const lateness = Math.max(0, cursor - deadline);
+        if (lateness > 0) missedFixedCount += 1;
+        totalLatenessMinutes += lateness;
+        bufferShortfallMinutes += Math.max(0, cursor - Math.max(startMinutes, deadline - fixedArrivalBufferMinutes));
+        totalWaitMinutes += Math.max(0, deadline - cursor);
+        cursor = Math.max(cursor, deadline);
+      }
+    }
+
+    cursor += stopVisitMinutes(stop);
+  }
+
+  const elapsedMinutes = Math.max(0, cursor - startMinutes);
+  return {
+    endMinutes: cursor,
+    totalTravelMinutes,
+    totalWaitMinutes,
+    totalLatenessMinutes,
+    bufferShortfallMinutes,
+    missedFixedCount,
+    distanceMeters,
+    score:
+      missedFixedCount * 1_000_000_000 +
+      totalLatenessMinutes * 1_000_000 +
+      bufferShortfallMinutes * 12_000 +
+      elapsedMinutes * 120 +
+      totalTravelMinutes * 35 +
+      totalWaitMinutes * 2 +
+      distanceMeters / 1000
+  };
+}
+
+function compareStopOrders(a: Stop[], b: Stop[], startMinutes: number) {
+  const aScore = simulateStopOrder(a, startMinutes).score;
+  const bScore = simulateStopOrder(b, startMinutes).score;
+  return aScore - bScore;
+}
+
+function minDistanceToOrder(stop: Stop, order: Stop[]) {
+  return order.reduce((best, placedStop) => Math.min(best, haversineMeters(stop, placedStop)), Number.POSITIVE_INFINITY);
+}
+
+function dedupeStopOrders(orders: Stop[][]) {
+  const seen = new Set<string>();
+  return orders.filter((order) => {
+    const key = order.map((stop) => stop.id).join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function transitCandidateLegCount(stops: Stop[]) {
   let count = 0;
   for (let index = 0; index < stops.length - 1; index += 1) {
@@ -898,33 +1143,40 @@ function nearestStopOrder(origin: Stop, candidates: Stop[]) {
   return ordered;
 }
 
-function optimizeStopsForDay(stops: Stop[], startMinutes = parseClock("09:00")) {
-  if (stops.length <= 2) return stops;
-  const origin = stops[0];
-  const endpoint = stops.slice(1).find(isEndpointStop);
-  const middleStops = stops.slice(1).filter((stop) => stop.id !== endpoint?.id);
-  const fixedStops = middleStops
-    .filter(isFixedStop)
-    .sort((a, b) => (fixedArrivalDeadlineMinutes(a) ?? 1440) - (fixedArrivalDeadlineMinutes(b) ?? 1440));
-  const freeStops = middleStops.filter((stop) => !isFixedStop(stop));
-
+function deadlineGreedyStopOrder(
+  origin: Stop,
+  freeStopsInput: Stop[],
+  fixedStopsInput: Stop[],
+  endpoint: Stop | undefined,
+  startMinutes: number
+) {
+  const fixedStops = [...fixedStopsInput].sort(
+    (a, b) => (fixedArrivalDeadlineMinutes(a) ?? 1440) - (fixedArrivalDeadlineMinutes(b) ?? 1440)
+  );
+  const freeStops = [...freeStopsInput];
   const ordered: Stop[] = [origin];
   let current = origin;
   let cursor = startMinutes;
 
   for (const fixedStop of fixedStops) {
     const deadline = fixedArrivalDeadlineMinutes(fixedStop);
-    while (freeStops.length && deadline !== null) {
+    const arrivalTarget = deadline === null ? null : Math.max(startMinutes, deadline - fixedArrivalBufferMinutes);
+    while (freeStops.length && arrivalTarget !== null) {
       let bestIndex = -1;
-      let bestDistance = Number.POSITIVE_INFINITY;
+      let bestScore = Number.POSITIVE_INFINITY;
       freeStops.forEach((candidate, index) => {
         const projectedArrivalAtFixed =
           cursor +
           estimateTravelMinutes(current, candidate) +
           stopVisitMinutes(candidate) +
           estimateTravelMinutes(candidate, fixedStop);
-        if (projectedArrivalAtFixed <= deadline && haversineMeters(current, candidate) < bestDistance) {
-          bestDistance = haversineMeters(current, candidate);
+        const latenessAgainstTarget = Math.max(0, projectedArrivalAtFixed - arrivalTarget);
+        const score =
+          latenessAgainstTarget * 1_000_000 +
+          estimateTravelMinutes(current, candidate) * 100 +
+          haversineMeters(current, candidate) / 100;
+        if (projectedArrivalAtFixed <= deadline! && score < bestScore) {
+          bestScore = score;
           bestIndex = index;
         }
       });
@@ -937,22 +1189,162 @@ function optimizeStopsForDay(stops: Stop[], startMinutes = parseClock("09:00")) 
 
     ordered.push(fixedStop);
     const arrival = cursor + estimateTravelMinutes(current, fixedStop);
-    const visitStart = Math.max(arrival, fixedWindowStartMinutes(fixedStop) ?? arrival);
-    cursor = fixedWindowEndMinutes(fixedStop) ?? visitStart + stopVisitMinutes(fixedStop);
+    const fixedStart = fixedWindowStartMinutes(fixedStop);
+    cursor = Math.max(arrival, fixedStart ?? arrival) + stopVisitMinutes(fixedStop);
     current = fixedStop;
   }
 
-  const remainingOrdered = nearestStopOrder(current, freeStops);
-  ordered.push(...remainingOrdered);
-  if (endpoint) {
-    ordered.push(endpoint);
+  ordered.push(...nearestStopOrder(current, freeStops));
+  if (endpoint) ordered.push(endpoint);
+  return ordered;
+}
+
+function insertionStopOrder(
+  origin: Stop,
+  freeStopsInput: Stop[],
+  fixedStopsInput: Stop[],
+  endpoint: Stop | undefined,
+  startMinutes: number
+) {
+  const fixedStops = [...fixedStopsInput].sort(
+    (a, b) => (fixedArrivalDeadlineMinutes(a) ?? 1440) - (fixedArrivalDeadlineMinutes(b) ?? 1440)
+  );
+  const order = endpoint ? [origin, ...fixedStops, endpoint] : [origin, ...fixedStops];
+  const remaining = [...freeStopsInput];
+
+  while (remaining.length) {
+    const currentScore = simulateStopOrder(order, startMinutes).score;
+    const candidateEntries = remaining
+      .map((stop, index) => ({ stop, index, distanceToOrder: minDistanceToOrder(stop, order) }))
+      .sort((a, b) => a.distanceToOrder - b.distanceToOrder)
+      .slice(0, Math.min(maxInsertionCandidatesPerRound, remaining.length));
+    const lastInsertPosition = endpoint ? Math.max(1, order.length - 1) : order.length;
+    let best: { remainingIndex: number; position: number; score: number; increase: number } | null = null;
+
+    for (const candidate of candidateEntries) {
+      for (let position = 1; position <= lastInsertPosition; position += 1) {
+        const trial = [...order];
+        trial.splice(position, 0, candidate.stop);
+        const score = simulateStopOrder(trial, startMinutes).score;
+        const increase = score - currentScore;
+        if (!best || score < best.score || (score === best.score && increase < best.increase)) {
+          best = {
+            remainingIndex: candidate.index,
+            position,
+            score,
+            increase
+          };
+        }
+      }
+    }
+
+    if (!best) {
+      const [fallback] = remaining.splice(0, 1);
+      order.splice(lastInsertPosition, 0, fallback);
+      continue;
+    }
+
+    const [next] = remaining.splice(best.remainingIndex, 1);
+    order.splice(best.position, 0, next);
   }
 
-  return ordered;
+  return order;
+}
+
+function improveStopOrderByRelocation(orderInput: Stop[], startMinutes: number) {
+  if (orderInput.length > maxRelocationOptimizationStops) return orderInput;
+  let order = [...orderInput];
+  let bestScore = simulateStopOrder(order, startMinutes).score;
+  const hasEndpoint = isEndpointStop(order[order.length - 1]);
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    let improved = false;
+    for (let fromIndex = 1; fromIndex < order.length; fromIndex += 1) {
+      if (hasEndpoint && fromIndex === order.length - 1) continue;
+      const movingStop = order[fromIndex];
+      const without = order.filter((_, index) => index !== fromIndex);
+      const lastInsertPosition = hasEndpoint ? Math.max(1, without.length - 1) : without.length;
+
+      for (let toIndex = 1; toIndex <= lastInsertPosition; toIndex += 1) {
+        if (toIndex === fromIndex || toIndex === fromIndex + 1) continue;
+        const trial = [...without];
+        trial.splice(toIndex, 0, movingStop);
+        const score = simulateStopOrder(trial, startMinutes).score;
+        if (score + 0.01 < bestScore) {
+          order = trial;
+          bestScore = score;
+          improved = true;
+        }
+      }
+    }
+    if (!improved) break;
+  }
+
+  return order;
+}
+
+function optimizeStopsForDay(stops: Stop[], startMinutes = parseClock("09:00")) {
+  if (stops.length <= 2) return stops;
+  const origin = stops[0];
+  const endpoint = stops.slice(1).find(isEndpointStop);
+  const middleStops = stops.slice(1).filter((stop) => stop.id !== endpoint?.id);
+  const fixedStops = middleStops.filter(isFixedStop);
+  const freeStops = middleStops.filter((stop) => !isFixedStop(stop));
+
+  const nearestOrder = [origin, ...nearestStopOrder(origin, middleStops.filter((stop) => stop.id !== endpoint?.id))];
+  if (endpoint) nearestOrder.push(endpoint);
+
+  const candidates = dedupeStopOrders([
+    stops,
+    nearestOrder,
+    deadlineGreedyStopOrder(origin, freeStops, fixedStops, endpoint, startMinutes),
+    insertionStopOrder(origin, freeStops, fixedStops, endpoint, startMinutes)
+  ]).map((order) => improveStopOrderByRelocation(order, startMinutes));
+
+  return candidates.reduce((best, candidate) =>
+    compareStopOrders(candidate, best, startMinutes) < 0 ? candidate : best
+  );
 }
 
 function isSameStopOrder(a: Stop[], b: Stop[]) {
   return a.length === b.length && a.every((stop, index) => stop.id === b[index]?.id);
+}
+
+function buildRouteStopsForPlan(stops: Stop[]) {
+  if (!stops.length) return [];
+  const startStop = stops.find(isStartStop) || stops[0];
+  const endStop = stops.find(isEndpointStop);
+  const middleStops = stops.filter((stop) => stop.id !== startStop.id && stop.id !== endStop?.id);
+  const routeStops = [startStop, ...middleStops];
+
+  if (endStop) {
+    if (endStop.id === startStop.id) {
+      if (middleStops.length) routeStops.push(startStop);
+    } else {
+      routeStops.push(endStop);
+    }
+  }
+
+  return routeStops;
+}
+
+function stopsFromRouteOrderForEditor(orderedStops: Stop[]) {
+  if (orderedStops.length > 1 && orderedStops[0]?.id === orderedStops[orderedStops.length - 1]?.id) {
+    return orderedStops.slice(0, -1);
+  }
+  return orderedStops;
+}
+
+function routeStartClock(stops: Stop[], fallback = "09:00") {
+  const startStop = stops.find(isStartStop) || stops[0];
+  return normalizeClockValue(startStop?.windowStart) || normalizeClockValue(fallback) || "09:00";
+}
+
+function routeDepartureClock(stops: Stop[], fallback = "09:00") {
+  const startStop = stops.find(isStartStop) || stops[0];
+  const startClock = routeStartClock(stops, fallback);
+  if (!startStop) return startClock;
+  return formatClock(parseClock(startClock) + stopVisitMinutes(startStop));
 }
 
 let mapsLoader: Promise<void> | null = null;
@@ -1024,18 +1416,19 @@ export default function App() {
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [isLoadingPlans, setIsLoadingPlans] = useState(true);
   const [planSyncMode, setPlanSyncMode] = useState<"server" | "local">("local");
-  const [departureStop, setDepartureStop] = useState<Stop | null>(null);
-  const [departureQuery, setDepartureQuery] = useState("");
-  const [departureResults, setDepartureResults] = useState<SearchResult[]>([]);
   const [stops, setStops] = useState<Stop[]>([]);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   const [tripDate, setTripDate] = useState(todayInputValue);
   const [startTime, setStartTime] = useState("09:00");
-  const [departureEndTime, setDepartureEndTime] = useState("09:00");
+  const departureStop = null as Stop | null;
+  const departureEndTime = startTime;
+  const setDepartureStop = (_stop: Stop | null) => undefined;
+  const setDepartureEndTime = (_value: string) => undefined;
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
+  const [routePlanStale, setRoutePlanStale] = useState(false);
+  const [markerRefreshKey, setMarkerRefreshKey] = useState(0);
   const [isRouting, setIsRouting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
-  const [isSearchingDeparture, setIsSearchingDeparture] = useState(false);
   const [isSearchingAnitabi, setIsSearchingAnitabi] = useState(false);
   const [isImportingAnitabi, setIsImportingAnitabi] = useState(false);
   const [anitabiQuery, setAnitabiQuery] = useState("");
@@ -1046,7 +1439,7 @@ export default function App() {
   const [mapProvider, setMapProvider] = useState<MapProvider>(browserApiKey ? "google" : "osm");
   const [mapError, setMapError] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [previewStopId, setPreviewStopId] = useState<string | null>(null);
+  const [imageLightboxStop, setImageLightboxStop] = useState<Stop | null>(null);
   const [isBoxSelectMode, setIsBoxSelectMode] = useState(false);
   const [selectedStopIds, setSelectedStopIds] = useState<string[]>([]);
   const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null);
@@ -1065,6 +1458,8 @@ export default function App() {
   const selectionStartRef = useRef<MapPoint | null>(null);
   const plansRef = useRef<DayPlan[]>(plans);
   const pendingActivePlanIdRef = useRef<string | null>(readStoredActivePlanId());
+  const anitabiSearchRequestRef = useRef(0);
+  const skipNextAnitabiAutoSearchRef = useRef(false);
 
   const persistPlanToServer = useCallback(
     async (plan: DayPlan) => {
@@ -1091,12 +1486,9 @@ export default function App() {
     setPlanName(plan.name);
     setTripDate(plan.tripDate);
     setStartTime(plan.startTime);
-    setDepartureEndTime(plan.departureEndTime || plan.startTime);
-    setDepartureStop(clonePlain(plan.departureStop || null));
-    setDepartureQuery(plan.departureStop?.name || "");
-    setDepartureResults([]);
     setStops(clonePlain(plan.stops));
     setRoutePlan(clonePlain(plan.routePlan));
+    setRoutePlanStale(false);
     setSelectedStopId(null);
     setSelectedStopIds([]);
     setSearchResults([]);
@@ -1188,8 +1580,8 @@ export default function App() {
         name: planName.trim() || defaultPlanName(tripDate),
         tripDate,
         startTime,
-        departureEndTime,
-        departureStop: clonePlain(departureStop),
+        departureEndTime: startTime,
+        departureStop: null,
         transitTimePreference: "departure" as TransitTimePreference,
         stops: clonePlain(stops),
         routePlan: clonePlain(routePlan),
@@ -1217,7 +1609,7 @@ export default function App() {
         }
       }
     },
-    [activePlanId, departureEndTime, departureStop, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, tripDate]
+    [activePlanId, persistPlanToServer, planName, planSyncMode, routePlan, startTime, stops, tripDate]
   );
 
   const backToPlanList = useCallback(() => {
@@ -1280,25 +1672,35 @@ export default function App() {
     });
     setSelectedStopId(nextStop.id);
     setSelectedStopIds([]);
-    setRoutePlan(null);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
     setSearchResults([]);
-  }, []);
+  }, [routePlan]);
 
   const updateStop = useCallback((id: string, patch: Partial<Stop>, shouldInvalidateRoute = false) => {
     setStops((current) =>
       current.map((stop) => {
         if (stop.id !== id) return stop;
         const nextStop = { ...stop, ...patch };
+        const stayMinutes = normalizeStayMinutes(nextStop.stayMinutes, isEndpointStop(nextStop) ? 0 : pilgrimageStayMinutes);
+        if (isFixedStop(nextStop)) {
+          const windowStart = normalizeClockValue(nextStop.windowStart) || "12:00";
+          return {
+            ...nextStop,
+            windowStart,
+            windowEnd: derivedFixedWindowEndClock(windowStart, stayMinutes),
+            stayMinutes
+          };
+        }
         return {
           ...nextStop,
-          stayMinutes: isEndpointStop(nextStop) ? 0 : pilgrimageStayMinutes
+          stayMinutes
         };
       })
     );
     if (shouldInvalidateRoute) {
-      setRoutePlan(null);
+      setRoutePlanStale((current) => Boolean(routePlan) || current);
     }
-  }, []);
+  }, [routePlan]);
 
   const updateStopRole = useCallback((id: string, role: StopRole) => {
     setStops((current) => {
@@ -1316,15 +1718,65 @@ export default function App() {
     });
     setSelectedStopId(id);
     setSelectedStopIds([]);
-    setRoutePlan(null);
-  }, []);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
+  }, [routePlan]);
+
+  const updateStopKind = useCallback((id: string, selection: StopKindSelection) => {
+    setStops((current) => {
+      const next = current.map((stop) => {
+        if (stop.id === id) return applyStopKindSelection(stop, selection);
+        let nextStop = stop;
+        if (selection === "departure" && isStartStop(nextStop)) {
+          nextStop = { ...nextStop, isStart: false };
+        }
+        if (selection === "end" && isEndpointStop(nextStop)) {
+          nextStop = {
+            ...nextStop,
+            role: nextStop.role === "end" ? "normal" : nextStop.role,
+            isEnd: false,
+            stayMinutes: pilgrimageStayMinutes
+          };
+        }
+        return nextStop;
+      });
+      const selected = next.find((stop) => stop.id === id);
+      if (!selected) return next;
+      if (isStartStop(selected)) return [selected, ...next.filter((stop) => stop.id !== id)];
+      if (isEndpointStop(selected)) return [...next.filter((stop) => stop.id !== id), selected];
+      return next;
+    });
+    setSelectedStopId(id);
+    setSelectedStopIds([]);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
+  }, [routePlan]);
+
+  const moveStopToDeparture = useCallback(
+    (id: string) => {
+      const stop = stops.find((item) => item.id === id);
+      if (!stop) return;
+      void ({
+        ...stop,
+        id: `departure-${stop.id}`,
+        stayMinutes: 0,
+        role: undefined,
+        windowStart: undefined,
+        windowEnd: undefined,
+        note: stop.note || "出发点"
+      });
+      setStops((current) => current.filter((item) => item.id !== id));
+      setSelectedStopId(null);
+      setSelectedStopIds([]);
+      setRoutePlanStale((current) => Boolean(routePlan) || current);
+    },
+    [routePlan, stops]
+  );
 
   const removeStop = useCallback((id: string) => {
     setStops((current) => current.filter((stop) => stop.id !== id));
     setSelectedStopId((current) => (current === id ? null : current));
     setSelectedStopIds((current) => current.filter((stopId) => stopId !== id));
-    setRoutePlan(null);
-  }, []);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
+  }, [routePlan]);
 
   const deleteSelectedStops = useCallback(() => {
     if (!selectedStopIds.length) {
@@ -1336,9 +1788,9 @@ export default function App() {
     setStops((current) => current.filter((stop) => !selected.has(stop.id)));
     setSelectedStopId(null);
     setSelectedStopIds([]);
-    setRoutePlan(null);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
     setToast(`已删除 ${selected.size} 个选中地点。`);
-  }, [selectedStopIds]);
+  }, [routePlan, selectedStopIds]);
 
   const reorderStops = useCallback((fromId: string, toId: string) => {
     if (fromId === toId) return;
@@ -1351,31 +1803,55 @@ export default function App() {
       next.splice(toIndex, 0, moved);
       return next;
     });
-    setRoutePlan(null);
-  }, []);
+    setRoutePlanStale((current) => Boolean(routePlan) || current);
+  }, [routePlan]);
 
   const routeStops = useMemo(
-    () => (departureStop ? [departureStop, ...stops] : stops),
-    [departureStop, stops]
+    () => buildRouteStopsForPlan(stops),
+    [stops]
+  );
+
+  const activeScheduleStartTime = useMemo(() => routeStartClock(stops, startTime), [startTime, stops]);
+  const activeRouteStartTime = useMemo(() => routeDepartureClock(stops, startTime), [startTime, stops]);
+
+  const isRoutePlanStale = useMemo(() => {
+    if (routePlanStale) return true;
+    if (!routePlan?.routeStopIds?.length) return false;
+    if (routePlan.routeStopIds.length !== routeStops.length) return true;
+    return routePlan.routeStopIds.some((stopId, index) => stopId !== routeStops[index]?.id);
+  }, [routePlan?.routeStopIds, routePlanStale, routeStops]);
+
+  const routeLegForStops = useCallback(
+    (fromStop: Stop, toStop: Stop, fallbackIndex: number) => {
+      if (!routePlan) return undefined;
+      if (routePlan.routeStopIds?.length) {
+        const routeLegIndex = routePlan.routeStopIds.findIndex(
+          (stopId, index) => stopId === fromStop.id && routePlan.routeStopIds?.[index + 1] === toStop.id
+        );
+        return routeLegIndex >= 0 ? routePlan.legs[routeLegIndex] : undefined;
+      }
+      return isRoutePlanStale ? undefined : routePlan.legs[fallbackIndex];
+    },
+    [isRoutePlanStale, routePlan]
   );
 
   const schedule = useMemo<ScheduleItem[]>(() => {
-    return buildScheduleItems(stops, routePlan?.legs, Boolean(departureStop), departureEndTime || startTime);
-  }, [departureEndTime, departureStop, routePlan?.legs, startTime, stops]);
+    return buildScheduleItems(stops, isRoutePlanStale ? undefined : routePlan?.legs, activeScheduleStartTime);
+  }, [activeScheduleStartTime, isRoutePlanStale, routePlan?.legs, stops]);
 
   const routeMetrics = useMemo(() => {
     const totalStay = stops.reduce((sum, stop) => sum + stopVisitMinutes(stop), 0);
     const totalTravel = Math.round((routePlan?.durationSeconds || 0) / 60);
     const end = schedule.length
       ? schedule[schedule.length - 1].departure
-      : parseClock(departureEndTime || startTime) + totalStay + totalTravel;
+      : parseClock(activeScheduleStartTime) + totalStay + totalTravel;
     return {
       totalStay,
       totalTravel,
       end,
       distance: routePlan?.distanceMeters || 0
     };
-  }, [departureEndTime, routePlan, schedule, startTime, stops]);
+  }, [activeScheduleStartTime, routePlan, schedule, stops]);
 
   const routingStatusText = useMemo(() => {
     const legCount = Math.max(0, routeStops.length - 1);
@@ -1517,6 +1993,17 @@ export default function App() {
   }, [toast]);
 
   useEffect(() => {
+    if (!imageLightboxStop) return undefined;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setImageLightboxStop(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [imageLightboxStop]);
+
+  useEffect(() => {
     plansRef.current = plans;
   }, [plans]);
 
@@ -1606,7 +2093,7 @@ export default function App() {
       void saveActivePlan(false);
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [activePlanId, departureEndTime, departureStop, planName, routePlan, saveActivePlan, startTime, stops, tripDate]);
+  }, [activePlanId, planName, routePlan, saveActivePlan, startTime, stops, tripDate]);
 
   useEffect(() => {
     if (activePlanId) return;
@@ -1758,7 +2245,9 @@ export default function App() {
             map: googleMapRef.current,
             position: departureStop.location,
             title: departureStop.name,
-            content: markerContent
+            content: markerContent,
+            collisionBehavior: google.maps.CollisionBehavior.REQUIRED,
+            zIndex: 2000
           })
         );
       }
@@ -1766,16 +2255,23 @@ export default function App() {
       markers.push(...stops.map((stop, index) => {
         const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
         const markerContent = document.createElement("button");
-        markerContent.className = `stop-marker ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}`;
-        markerContent.textContent = stopSequenceLabel(stop, index);
+        markerContent.className = `stop-marker ${selected ? "is-selected" : ""} ${isStartStop(stop) ? "is-start" : ""} ${isPilgrimageStop(stop) ? "is-pilgrimage" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}`;
+        markerContent.textContent = routeStopSequenceLabel(stop, index);
         markerContent.title = stop.name;
-        markerContent.addEventListener("click", () => setSelectedStopId(stop.id));
+        markerContent.addEventListener("click", () => {
+          setSelectedStopId(stop.id);
+          if (stop.imageUrl || stop.thumbnailUrl) {
+            setImageLightboxStop(stop);
+          }
+        });
 
         const marker = new google.maps.marker.AdvancedMarkerElement({
           map: googleMapRef.current,
           position: stop.location,
           title: stop.name,
-          content: markerContent
+          content: markerContent,
+          collisionBehavior: google.maps.CollisionBehavior.REQUIRED,
+          zIndex: selected ? 2000 : isStartStop(stop) || isEndpointStop(stop) ? 1500 : 1000 + index
         });
 
         if (stop.imageUrl || stop.thumbnailUrl) {
@@ -1829,13 +2325,18 @@ export default function App() {
       const size = selected ? 37 : 31;
       const icon = L.divIcon({
         className: "leaflet-stop-marker",
-        html: `<button class="stop-marker ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}">${stopSequenceLabel(stop, index)}</button>`,
+        html: `<button class="stop-marker ${selected ? "is-selected" : ""} ${isStartStop(stop) ? "is-start" : ""} ${isPilgrimageStop(stop) ? "is-pilgrimage" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}">${routeStopSequenceLabel(stop, index)}</button>`,
         iconSize: [size, size],
         iconAnchor: [size / 2, size / 2]
       });
       const marker = L.marker([stop.location.lat, stop.location.lng], { icon })
         .addTo(leafletMapRef.current!)
-        .on("click", () => setSelectedStopId(stop.id));
+        .on("click", () => {
+          setSelectedStopId(stop.id);
+          if (stop.imageUrl || stop.thumbnailUrl) {
+            setImageLightboxStop(stop);
+          }
+        });
 
       if (stop.imageUrl || stop.thumbnailUrl) {
         marker
@@ -1856,7 +2357,7 @@ export default function App() {
       return marker;
     }));
     leafletMarkersRef.current = markers;
-  }, [activePlanId, departureStop, mapProvider, mapReady, selectedStopId, selectedStopSet, stops]);
+  }, [activePlanId, mapProvider, mapReady, markerRefreshKey, selectedStopId, selectedStopSet, stops]);
 
   useEffect(() => {
     if (!activePlanId || !mapReady || !routeStops.length) return;
@@ -1893,11 +2394,25 @@ export default function App() {
         map: googleMapRef.current,
         strokeColor: "#167c80",
         strokeOpacity: 0.94,
-        strokeWeight: 5
+        strokeWeight: 5,
+        zIndex: 50
       });
       const bounds = new google.maps.LatLngBounds();
       path.forEach((point) => bounds.extend(point));
-      googleMapRef.current.fitBounds(bounds, 90);
+      routeStops.forEach((stop) => bounds.extend(stop.location));
+      const map = googleMapRef.current;
+      map.fitBounds(bounds, 90);
+      const refreshMarkers = () => {
+        for (const marker of googleMarkersRef.current) {
+          marker.map = null;
+          marker.map = map;
+        }
+      };
+      google.maps.event.addListenerOnce(map, "idle", refreshMarkers);
+      window.setTimeout(() => {
+        refreshMarkers();
+        setMarkerRefreshKey((current) => current + 1);
+      }, 350);
       googlePolylineRef.current = polyline;
       return;
     }
@@ -1914,9 +2429,11 @@ export default function App() {
       opacity: 0.94,
       weight: 5
     }).addTo(leafletMapRef.current);
-    leafletMapRef.current.fitBounds(polyline.getBounds(), { padding: [80, 80] });
+    const bounds = polyline.getBounds();
+    routeStops.forEach((stop) => bounds.extend([stop.location.lat, stop.location.lng]));
+    leafletMapRef.current.fitBounds(bounds, { padding: [80, 80] });
     leafletPolylineRef.current = polyline;
-  }, [activePlanId, mapProvider, mapReady, routePlan]);
+  }, [activePlanId, mapProvider, mapReady, routeBoundsKey, routePlan, routeStops]);
 
   const runNominatimSearch = useCallback(async (query: string) => {
     if (query.trim().length < 2) {
@@ -1956,97 +2473,6 @@ export default function App() {
     [addStop]
   );
 
-  const setDepartureFromResult = useCallback((result: SearchResult) => {
-    const nextDeparture: Stop = {
-      id: `departure-${makeId()}`,
-      name: result.name,
-      address: result.address,
-      placeId: typeof result.id === "string" ? result.id : undefined,
-      location: { lat: result.lat, lng: result.lng },
-      stayMinutes: 0,
-      note: "出发点",
-      source: result.source
-    };
-    setDepartureStop(nextDeparture);
-    setDepartureQuery(result.name);
-    setDepartureResults([]);
-    setRoutePlan(null);
-  }, []);
-
-  const searchDeparturePoint = useCallback(async () => {
-    const query = departureQuery.trim();
-    const coordinates = tryParseCoordinates(query);
-    if (coordinates) {
-      setDepartureFromResult({
-        id: "coordinate",
-        name: "坐标出发点",
-        address: `${coordinates.lat.toFixed(6)}, ${coordinates.lng.toFixed(6)}`,
-        lat: coordinates.lat,
-        lng: coordinates.lng,
-        source: "coordinate"
-      });
-      return;
-    }
-
-    if (query.length < 2) {
-      setToast("请输入至少两个字的出发点。");
-      return;
-    }
-
-    setIsSearchingDeparture(true);
-    try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const data = await readApiJson(response, "出发点搜索失败。");
-      const results = Array.isArray(data) ? data : [];
-      setDepartureResults(results);
-      if (!results.length) {
-        setToast("没有找到匹配的出发点。");
-      }
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "出发点搜索失败。");
-    } finally {
-      setIsSearchingDeparture(false);
-    }
-  }, [departureQuery, setDepartureFromResult]);
-
-  useEffect(() => {
-    if (!activePlanId) return undefined;
-
-    const query = departureQuery.trim();
-    if (query.length < 2 || query === departureStop?.name || tryParseCoordinates(query)) {
-      setDepartureResults([]);
-      setIsSearchingDeparture(false);
-      return undefined;
-    }
-
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      setIsSearchingDeparture(true);
-      try {
-        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-        const data = await readApiJson(response, "出发点搜索失败。");
-        if (!cancelled) {
-          setDepartureResults(Array.isArray(data) ? data : []);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          console.error("Departure autocomplete failed", error);
-          setDepartureResults([]);
-        }
-      } finally {
-        if (!cancelled) {
-          setIsSearchingDeparture(false);
-        }
-      }
-    }, 450);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-      setIsSearchingDeparture(false);
-    };
-  }, [activePlanId, departureQuery, departureStop?.name]);
-
   const calculateRoute = useCallback(
     async () => {
       if (routeStops.length < 2) {
@@ -2059,7 +2485,7 @@ export default function App() {
         return;
       }
 
-      const routeDepartureTime = departureEndTime || startTime;
+      const routeDepartureTime = activeRouteStartTime;
       const transitDateTime = buildLocalDateTimeIso(tripDate, routeDepartureTime);
       if (!transitDateTime) {
         setToast("请选择有效的路线日期和时间。");
@@ -2071,7 +2497,8 @@ export default function App() {
         ...stop,
         stayMinutes: stopVisitMinutes(stop)
       }));
-      const orderChanged = !isSameStopOrder(routeStops, orderedStops);
+      const nextPlanStops = stopsFromRouteOrderForEditor(orderedStops);
+      const orderChanged = !isSameStopOrder(stops, nextPlanStops);
       const beforeDistance = routeDistanceMeters(routeStops);
       const afterDistance = routeDistanceMeters(orderedStops);
 
@@ -2098,16 +2525,9 @@ export default function App() {
           throw new Error("没有返回可用路线。");
         }
 
-        const nextPlanStops = departureStop ? orderedStops.slice(1) : orderedStops;
         if (orderChanged) {
-          if (departureStop) {
-            setDepartureStop(orderedStops[0] || departureStop);
-            setStops(nextPlanStops);
-            setSelectedStopId(orderedStops[1]?.id || null);
-          } else {
-            setStops(nextPlanStops);
-            setSelectedStopId(orderedStops[0]?.id || null);
-          }
+          setStops(nextPlanStops);
+          setSelectedStopId(nextPlanStops[0]?.id || null);
           setSelectedStopIds([]);
         }
         const nextRoutePlan: RoutePlan = {
@@ -2142,11 +2562,13 @@ export default function App() {
             transfers: leg.transfers,
             fare: leg.fare
           })),
+          routeStopIds: orderedStops.map((stop) => stop.id),
           provider: route.provider
         };
         setRoutePlan(nextRoutePlan);
+        setRoutePlanStale(false);
         const fallbackCount = route.strategy?.fallbackWalkingLegs || 0;
-        const lateFixedStops = buildScheduleItems(nextPlanStops, nextRoutePlan.legs, Boolean(departureStop), routeDepartureTime)
+        const lateFixedStops = buildScheduleItems(nextPlanStops, nextRoutePlan.legs, routeDepartureTime)
           .filter((item) => item.isLate)
           .map((item) => item.stop.name);
         const sortMessage = orderChanged
@@ -2165,7 +2587,7 @@ export default function App() {
         setIsRouting(false);
       }
     },
-    [departureEndTime, departureStop, routeStops, startTime, tripDate]
+    [activeRouteStartTime, routeStops, stops, tripDate]
   );
 
   const handleSearchEnter = useCallback(
@@ -2226,34 +2648,74 @@ export default function App() {
         return;
       }
       setStops((current) => appendBeforeEndpoint(current, importedStops));
-      setRoutePlan(null);
+      setRoutePlanStale((current) => Boolean(routePlan) || current);
       setToast(`已导入 ${importedStops.length} 个地点。`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "KML 导入失败。");
     }
-  }, []);
+  }, [routePlan]);
 
-  const searchAnitabiWorks = useCallback(async () => {
-    const query = anitabiQuery.trim();
+  const runAnitabiSearch = useCallback(async (queryInput: string, options: { showToast?: boolean } = {}) => {
+    const query = queryInput.trim();
+    const requestId = ++anitabiSearchRequestRef.current;
     if (!/^\d+$/.test(query) && query.length < 2) {
-      setToast("请输入至少两个字的作品名。");
+      setAnitabiResults([]);
+      setIsSearchingAnitabi(false);
+      if (options.showToast) setToast("请输入至少两个字的作品名。");
       return;
     }
 
     setIsSearchingAnitabi(true);
-    setAnitabiResults([]);
+    if (options.showToast) setAnitabiResults([]);
     try {
       const response = await fetch(`/api/anitabi/search?q=${encodeURIComponent(query)}`);
       const data = await readApiJson(response, "Anitabi 作品查找失败。");
       const results = Array.isArray(data?.results) ? data.results : [];
+      if (requestId !== anitabiSearchRequestRef.current) return;
       setAnitabiResults(results);
-      setToast(results.length ? `找到 ${results.length} 个可导入作品。` : "没有找到含截图点位的 Anitabi 作品。");
+      if (options.showToast) {
+        setToast(results.length ? `找到 ${results.length} 个可导入作品。` : "没有找到含截图点位的 Anitabi 作品。");
+      }
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Anitabi 作品查找失败。");
+      if (requestId !== anitabiSearchRequestRef.current) return;
+      setAnitabiResults([]);
+      if (options.showToast) {
+        setToast(error instanceof Error ? error.message : "Anitabi 作品查找失败。");
+      }
     } finally {
-      setIsSearchingAnitabi(false);
+      if (requestId === anitabiSearchRequestRef.current) {
+        setIsSearchingAnitabi(false);
+      }
     }
-  }, [anitabiQuery]);
+  }, []);
+
+  const searchAnitabiWorks = useCallback(() => {
+    void runAnitabiSearch(anitabiQuery, { showToast: true });
+  }, [anitabiQuery, runAnitabiSearch]);
+
+  useEffect(() => {
+    if (skipNextAnitabiAutoSearchRef.current) {
+      skipNextAnitabiAutoSearchRef.current = false;
+      anitabiSearchRequestRef.current += 1;
+      setIsSearchingAnitabi(false);
+      setAnitabiResults([]);
+      return;
+    }
+
+    const query = anitabiQuery.trim();
+    if (!query || (!/^\d+$/.test(query) && query.length < 2)) {
+      anitabiSearchRequestRef.current += 1;
+      setIsSearchingAnitabi(false);
+      setAnitabiResults([]);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void runAnitabiSearch(query);
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [anitabiQuery, runAnitabiSearch]);
 
   const importAnitabiSubjectPoints = useCallback(async (subjectIdInput: number | string) => {
     const subjectId = String(subjectIdInput).trim();
@@ -2285,6 +2747,7 @@ export default function App() {
           location: { lat: Number(point.geo[0]), lng: Number(point.geo[1]) },
           stayMinutes: pilgrimageStayMinutes,
           note: "巡礼",
+          role: "pilgrimage",
           source: `Anitabi ${subjectId}`,
           imageUrl: anitabiImageVariant(point.image),
           thumbnailUrl: point.image,
@@ -2302,7 +2765,8 @@ export default function App() {
       }
 
       setStops((current) => appendBeforeEndpoint(current, importedStops));
-      setRoutePlan(null);
+      setRoutePlanStale((current) => Boolean(routePlan) || current);
+      skipNextAnitabiAutoSearchRef.current = true;
       setAnitabiQuery(workTitle);
       setAnitabiResults([]);
       setToast(`已导入 ${importedStops.length} 个 Anitabi 截图点位。鼠标悬浮地点或地图标记可看图。`);
@@ -2311,13 +2775,14 @@ export default function App() {
     } finally {
       setIsImportingAnitabi(false);
     }
-  }, []);
+  }, [routePlan]);
 
   const clearTrip = useCallback(() => {
     setStops([]);
     setSelectedStopId(null);
     setSelectedStopIds([]);
     setRoutePlan(null);
+    setRoutePlanStale(false);
   }, []);
 
   const exportJson = useCallback(() => {
@@ -2330,8 +2795,8 @@ export default function App() {
           mapProvider,
           tripDate,
           startTime,
-          departureEndTime,
-          departureStop,
+          departureEndTime: startTime,
+          departureStop: null,
           transitTimePreference: "departure",
           routeStrategy: "time-window-aware-nearest-neighbor-transit-first",
           stops,
@@ -2343,7 +2808,7 @@ export default function App() {
       "application/json"
     );
     setToast("JSON 已导出。");
-  }, [departureEndTime, departureStop, mapProvider, planName, routePlan, startTime, stops, tripDate]);
+  }, [mapProvider, planName, routePlan, startTime, stops, tripDate]);
 
   const copyGoogleMapsLink = useCallback(async () => {
     if (routeStops.length < 2) {
@@ -2587,79 +3052,62 @@ export default function App() {
             <input
               type="date"
               value={tripDate}
-              onInput={(event) => setTripDate(event.currentTarget.value)}
-              onChange={(event) => setTripDate(event.currentTarget.value)}
+              onInput={(event) => {
+                setTripDate(event.currentTarget.value);
+                setRoutePlanStale((current) => Boolean(routePlan) || current);
+              }}
+              onChange={(event) => {
+                setTripDate(event.currentTarget.value);
+                setRoutePlanStale((current) => Boolean(routePlan) || current);
+              }}
             />
           </label>
           <label className="field">
             <span>起点开始</span>
-            <input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
+            <input
+              type="time"
+              value={startTime}
+              onChange={(event) => {
+                setStartTime(event.target.value);
+                setRoutePlanStale((current) => Boolean(routePlan) || current);
+              }}
+            />
           </label>
           <label className="field">
             <span>起点结束</span>
-            <input type="time" value={departureEndTime} onChange={(event) => setDepartureEndTime(event.target.value)} />
+            <input
+              type="time"
+              value={departureEndTime}
+              onChange={(event) => {
+                setDepartureEndTime(event.target.value);
+                setRoutePlanStale((current) => Boolean(routePlan) || current);
+              }}
+            />
           </label>
         </div>
 
-        <div className="departure-panel">
-          <div className="departure-row">
-            <input
-              value={departureQuery}
-              placeholder="搜索出发点，例如 京都站 / 新宿站"
-              onChange={(event) => {
-                setDepartureQuery(event.target.value);
-                setDepartureResults([]);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  void searchDeparturePoint();
-                }
-              }}
-            />
+        {departureStop && (
+          <div className="departure-current">
+            <MapPin size={16} />
+            <div>
+              <strong>{departureStop.name}</strong>
+              <span className="type-pill is-departure">起点</span>
+              <span>{departureStop.address || `${departureStop.location.lat.toFixed(5)}, ${departureStop.location.lng.toFixed(5)}`}</span>
+            </div>
             <button
-              className="secondary-button"
+              className="icon-button danger"
               type="button"
-              disabled={isSearchingDeparture}
-              onClick={searchDeparturePoint}
+              title="清除出发点"
+              aria-label="清除出发点"
+              onClick={() => {
+                setDepartureStop(null);
+                setRoutePlanStale((current) => Boolean(routePlan) || current);
+              }}
             >
-              <LocateFixed size={17} />
-              {isSearchingDeparture ? "搜索中" : "设置起点"}
+              <X size={16} />
             </button>
           </div>
-          {departureResults.length > 0 && (
-            <div className="departure-results">
-              {departureResults.map((result) => (
-                <button key={result.id} type="button" onClick={() => setDepartureFromResult(result)}>
-                  <strong>{result.name}</strong>
-                  <span>{result.address}</span>
-                </button>
-              ))}
-            </div>
-          )}
-          {departureStop && (
-            <div className="departure-current">
-              <MapPin size={16} />
-              <div>
-                <strong>{departureStop.name}</strong>
-                <span>{departureStop.address || `${departureStop.location.lat.toFixed(5)}, ${departureStop.location.lng.toFixed(5)}`}</span>
-              </div>
-              <button
-                className="icon-button danger"
-                type="button"
-                title="清除出发点"
-                aria-label="清除出发点"
-                onClick={() => {
-                  setDepartureStop(null);
-                  setDepartureQuery("");
-                  setDepartureResults([]);
-                  setRoutePlan(null);
-                }}
-              >
-                <X size={16} />
-              </button>
-            </div>
-          )}
-        </div>
+        )}
 
         <div className="search-wrap">
           <div className="search-row">
@@ -2697,70 +3145,76 @@ export default function App() {
           )}
         </div>
 
-        <div className="anitabi-row">
-          <input
-            value={anitabiQuery}
-            placeholder="输入作品名，如 吹响吧 / CLANNAD"
-            onChange={(event) => {
-              setAnitabiQuery(event.target.value);
-              setAnitabiResults([]);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                void searchAnitabiWorks();
-              }
-            }}
-          />
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={isSearchingAnitabi || isImportingAnitabi}
-            onClick={searchAnitabiWorks}
-          >
-            <MapPin size={18} />
-            {isSearchingAnitabi ? "查找中" : "查找 Anitabi"}
-          </button>
-        </div>
-        {anitabiResults.length > 0 && (
-          <div className="anitabi-results" aria-label="Anitabi 作品候选">
-            {anitabiResults.map((result) => {
-              const displayTitle = result.cn || result.title || `Bangumi ${result.id}`;
-              const originalTitle = result.title && result.title !== displayTitle ? result.title : "";
-              const meta = [
-                result.city,
-                result.date,
-                `${result.pointsLength || 0} 点位`,
-                `${result.imagesLength || 0} 截图`
-              ].filter(Boolean);
-              return (
-                <article className="anitabi-result-card" key={result.id}>
-                  {result.cover ? (
-                    <img className="anitabi-result-cover" src={result.cover} alt="" loading="lazy" />
-                  ) : (
-                    <div className="anitabi-result-cover" aria-hidden="true" />
-                  )}
-                  <div className="anitabi-result-copy">
-                    <strong>{displayTitle}</strong>
-                    {originalTitle && <span>{originalTitle}</span>}
-                    <small>{meta.join(" / ")}</small>
-                    {Array.isArray(result.samplePoints) && result.samplePoints.length > 0 && (
-                      <small>{result.samplePoints.join("、")}</small>
-                    )}
-                  </div>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={isImportingAnitabi}
-                    onClick={() => void importAnitabiSubjectPoints(result.id)}
-                  >
-                    <Upload size={16} />
-                    {isImportingAnitabi ? "导入中" : "导入"}
-                  </button>
-                </article>
-              );
-            })}
+        <div className="anitabi-search-box">
+          <div className="anitabi-row">
+            <input
+              value={anitabiQuery}
+              placeholder="输入作品名，如 吹响吧 / CLANNAD"
+              onChange={(event) => {
+                setAnitabiQuery(event.target.value);
+                setAnitabiResults([]);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  void searchAnitabiWorks();
+                }
+              }}
+            />
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={isSearchingAnitabi || isImportingAnitabi}
+              onClick={searchAnitabiWorks}
+            >
+              <MapPin size={18} />
+              {isSearchingAnitabi ? "查找中" : "查找 Anitabi"}
+            </button>
           </div>
-        )}
+          {(isSearchingAnitabi || anitabiResults.length > 0) && (
+            <div className="anitabi-results" aria-label="Anitabi 作品候选">
+              {isSearchingAnitabi && !anitabiResults.length ? (
+                <div className="anitabi-result-empty">正在查找 Anitabi 作品...</div>
+              ) : (
+                anitabiResults.map((result) => {
+                  const displayTitle = result.cn || result.title || `Bangumi ${result.id}`;
+                  const originalTitle = result.title && result.title !== displayTitle ? result.title : "";
+                  const meta = [
+                    result.city,
+                    result.date,
+                    `${result.pointsLength || 0} 点位`,
+                    `${result.imagesLength || 0} 截图`
+                  ].filter(Boolean);
+                  return (
+                    <article className="anitabi-result-card" key={result.id}>
+                      {result.cover ? (
+                        <img className="anitabi-result-cover" src={result.cover} alt="" loading="lazy" />
+                      ) : (
+                        <div className="anitabi-result-cover" aria-hidden="true" />
+                      )}
+                      <div className="anitabi-result-copy">
+                        <strong>{displayTitle}</strong>
+                        {originalTitle && <span>{originalTitle}</span>}
+                        <small>{meta.join(" / ")}</small>
+                        {Array.isArray(result.samplePoints) && result.samplePoints.length > 0 && (
+                          <small>{result.samplePoints.join("、")}</small>
+                        )}
+                      </div>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={isImportingAnitabi}
+                        onClick={() => void importAnitabiSubjectPoints(result.id)}
+                      >
+                        <Upload size={16} />
+                        {isImportingAnitabi ? "导入中" : "导入"}
+                      </button>
+                    </article>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
 
         <div className="route-actions">
           <button className="primary-button" type="button" disabled={isRouting} onClick={() => calculateRoute()}>
@@ -2771,6 +3225,11 @@ export default function App() {
             <div className="routing-status" role="status" aria-live="polite">
               <span className="inline-spinner" aria-hidden="true" />
               <span>{routingStatusText}</span>
+            </div>
+          )}
+          {routePlan && isRoutePlanStale && !isRouting && (
+            <div className="route-stale-note" role="status">
+              已保留上一次路线；新增、删除或时间调整尚未纳入，点击自动规划路线后更新。
             </div>
           )}
           <div className="selection-actions">
@@ -2822,28 +3281,26 @@ export default function App() {
         </div>
 
         <section className="stop-list" aria-label="地点列表">
-          {departureStop && stops[0] && routePlan?.legs[0] && (
+          {departureStop && stops[0] && routeLegForStops(departureStop, stops[0], 0) && (
             <Fragment key="departure-leg">
-              {renderRouteLegCard(routePlan.legs[0], departureStop, stops[0], "出", stopSequenceLabel(stops[0], 0))}
+              {renderRouteLegCard(routeLegForStops(departureStop, stops[0], 0)!, departureStop, stops[0], "出", stopSequenceLabel(stops[0], 0))}
             </Fragment>
           )}
           {stops.map((stop, index) => {
             const item = schedule[index];
             const selected = selectedStopId === stop.id || selectedStopSet.has(stop.id);
-            const routeLeg = routePlan?.legs[departureStop ? index + 1 : index];
-            const nextStop = stops[index + 1];
+            const routeReturnStop = index === stops.length - 1 && routeStops.length > stops.length ? routeStops[routeStops.length - 1] : undefined;
+            const nextStop = stops[index + 1] || routeReturnStop;
+            const routeLeg = nextStop ? routeLegForStops(stop, nextStop, index) : undefined;
             const RouteSummaryIcon = routeLeg?.mode === "WALK" ? Footprints : TrainFront;
             const role = getStopRole(stop);
-            const stopIndexLabel = stopSequenceLabel(stop, index);
+            const kind = stopKindSelection(stop);
+            const stopIndexLabel = routeStopSequenceLabel(stop, index);
             return (
               <Fragment key={stop.id}>
                 <div
-                  className={`stop-card ${selected ? "is-selected" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""} ${item.isLate ? "is-late" : ""}`}
+                  className={`stop-card ${selected ? "is-selected" : ""} ${isStartStop(stop) ? "is-start" : ""} ${isPilgrimageStop(stop) ? "is-pilgrimage" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""} ${item.isLate ? "is-late" : ""}`}
                   draggable
-                  onMouseEnter={() => setPreviewStopId(stop.id)}
-                  onMouseLeave={() => setPreviewStopId((current) => (current === stop.id ? null : current))}
-                  onFocus={() => setPreviewStopId(stop.id)}
-                  onBlur={() => setPreviewStopId((current) => (current === stop.id ? null : current))}
                   onDragStart={(event) => handleDragStart(event, stop.id)}
                   onDragOver={(event) => event.preventDefault()}
                   onDrop={(event) => handleDrop(event, stop.id)}
@@ -2868,14 +3325,42 @@ export default function App() {
                       onChange={(event) => updateStop(stop.id, { note: event.target.value })}
                     />
                     <div className="stop-controls">
-                      <label className="compact-field">
+                      <label className={`compact-field role-field is-${kind}`}>
                         <span>类型</span>
-                        <select value={role} onChange={(event) => updateStopRole(stop.id, event.target.value as StopRole)}>
-                          <option value="normal">巡礼</option>
+                        <select
+                          value={kind}
+                          onChange={(event) => updateStopKind(stop.id, event.target.value as StopKindSelection)}
+                        >
+                          <option value="departure">起点</option>
+                          <option value="normal">普通点</option>
+                          <option value="pilgrimage">巡礼点</option>
                           <option value="fixed">定点</option>
                           <option value="end">终点</option>
                         </select>
                       </label>
+                      <label className="compact-field stay-minutes-field">
+                        <span>停留</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={720}
+                          step={1}
+                          value={stopVisitMinutes(stop)}
+                          onChange={(event) => updateStop(stop.id, { stayMinutes: normalizeStayMinutes(event.target.value, 0) }, true)}
+                        />
+                      </label>
+                      {isStartStop(stop) && (
+                        <div className="time-window-fields time-window-fields-start">
+                          <label className="compact-field">
+                            <span>开始</span>
+                            <input
+                              type="time"
+                              value={stop.windowStart || ""}
+                              onChange={(event) => updateStop(stop.id, { windowStart: event.target.value, windowEnd: undefined }, true)}
+                            />
+                          </label>
+                        </div>
+                      )}
                       {role === "fixed" && (
                         <div className="time-window-fields">
                           <label className="compact-field">
@@ -2886,14 +3371,6 @@ export default function App() {
                               onChange={(event) => updateStop(stop.id, { windowStart: event.target.value }, true)}
                             />
                           </label>
-                          <label className="compact-field">
-                            <span>结束</span>
-                            <input
-                              type="time"
-                              value={stop.windowEnd || ""}
-                              onChange={(event) => updateStop(stop.id, { windowEnd: event.target.value }, true)}
-                            />
-                          </label>
                         </div>
                       )}
                     </div>
@@ -2902,43 +3379,56 @@ export default function App() {
                         <Clock3 size={14} />
                         {isEndpointStop(stop) ? `到达 ${formatClock(item.arrival)}` : `${formatClock(item.visitStart)} - ${formatClock(item.departure)}`}
                       </span>
-                      <span>{stopRoleLabel(stop)}{isEndpointStop(stop) ? "" : ` ${stopVisitMinutes(stop)} 分钟`}</span>
+                      <span className={`type-pill is-${kind === "end" ? "endpoint" : kind}`}>{stopKindLabel(stop)}</span>
+                      <span className="visit-duration">停留 {stopVisitMinutes(stop)} 分钟</span>
                       {item.waitMinutes > 0 && <span>等待 {item.waitMinutes} 分钟</span>}
                       {item.isLate && <span className="is-late-badge">定点可能迟到</span>}
-                      {index < stops.length - 1 && (
+                      {nextStop && (
                         <span>
                           <Navigation size={14} />
                           {item.travelToNextMinutes} 分钟
                         </span>
                       )}
-                      {index < stops.length - 1 && routeLeg?.summary && (
+                      {nextStop && routeLeg?.summary && (
                         <span className="route-summary" title={routeLeg.summary}>
                           <RouteSummaryIcon size={14} />
                           {routeLeg.summary}
                         </span>
                       )}
                       {stop.source?.startsWith("Anitabi") && <span>{stop.source}</span>}
+                      {(stop.imageUrl || stop.thumbnailUrl) && (
+                        <button
+                          className="meta-image-button"
+                          type="button"
+                          title="查看大图"
+                          aria-label={`查看 ${stop.name} 的大图`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setImageLightboxStop(stop);
+                          }}
+                        >
+                          <ImageIcon size={14} />
+                          查看图片
+                        </button>
+                      )}
                     </div>
                   </div>
-                  <div className="stay-field" title={isEndpointStop(stop) ? "终点不设置停留时间" : "巡礼时间固定 5 分钟"}>
-                    <strong>{isEndpointStop(stop) ? "终" : stopVisitMinutes(stop)}</strong>
-                    {!isEndpointStop(stop) && <span>分</span>}
+                  <div className="stop-actions">
+                    <button
+                      className="icon-button danger"
+                      type="button"
+                      title="删除地点"
+                      aria-label="删除地点"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeStop(stop.id);
+                      }}
+                    >
+                      <Trash2 size={17} />
+                    </button>
                   </div>
-                  <button className="icon-button danger" type="button" title="删除地点" aria-label="删除地点" onClick={() => removeStop(stop.id)}>
-                    <Trash2 size={17} />
-                  </button>
-                  {(stop.imageUrl || stop.thumbnailUrl) && previewStopId === stop.id && (
-                    <div className="stop-image-preview" aria-hidden="true">
-                      <img src={anitabiImageVariant(stop.imageUrl || stop.thumbnailUrl)} alt="" loading="lazy" />
-                      <div>
-                        <strong>{stop.name}</strong>
-                        {formatAnitabiMeta(stop) && <span>{formatAnitabiMeta(stop)}</span>}
-                        {stop.origin && <small>来源：{stop.origin}</small>}
-                      </div>
-                    </div>
-                  )}
                 </div>
-                {nextStop && routeLeg && renderRouteLegCard(routeLeg, stop, nextStop, stopSequenceLabel(stop, index), stopSequenceLabel(nextStop, index + 1))}
+                {nextStop && routeLeg && renderRouteLegCard(routeLeg, stop, nextStop, routeStopSequenceLabel(stop, index), routeStopSequenceLabel(nextStop, index + 1))}
               </Fragment>
             );
           })}
@@ -2998,11 +3488,47 @@ export default function App() {
           <RefreshCw size={15} />
           <span>
             {routePlan
-              ? `${formatDuration(routePlan.durationSeconds)} · ${routeProviderLabel(routePlan.provider, mapProvider)}`
+              ? `${isRoutePlanStale ? "上次路线 · " : ""}${formatDuration(routePlan.durationSeconds)} · ${routeProviderLabel(routePlan.provider, mapProvider)}`
               : `${mapProvider === "google" ? "Google" : "免费"}模式`}
           </span>
         </div>
       </section>
+
+      {imageLightboxStop && (
+        <div className="image-lightbox" role="dialog" aria-modal="true" aria-label={`${imageLightboxStop.name} 大图`} onClick={() => setImageLightboxStop(null)}>
+          <div className="image-lightbox-panel" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <strong>{imageLightboxStop.name}</strong>
+                {formatAnitabiMeta(imageLightboxStop) && <span>{formatAnitabiMeta(imageLightboxStop)}</span>}
+              </div>
+              <button className="icon-button subtle" type="button" title="关闭大图" aria-label="关闭大图" onClick={() => setImageLightboxStop(null)}>
+                <X size={18} />
+              </button>
+            </header>
+            <img
+              src={anitabiOriginalImageUrl(imageLightboxStop.thumbnailUrl || imageLightboxStop.imageUrl)}
+              alt={imageLightboxStop.name}
+              onError={(event) => {
+                const fallbackUrl = anitabiImageVariant(imageLightboxStop.imageUrl || imageLightboxStop.thumbnailUrl);
+                if (fallbackUrl && event.currentTarget.src !== fallbackUrl) {
+                  event.currentTarget.src = fallbackUrl;
+                }
+              }}
+            />
+            {(imageLightboxStop.origin || imageLightboxStop.originUrl) && (
+              <footer>
+                {imageLightboxStop.origin && <span>来源：{imageLightboxStop.origin}</span>}
+                {imageLightboxStop.originUrl && (
+                  <a href={imageLightboxStop.originUrl} target="_blank" rel="noreferrer">
+                    查看来源
+                  </a>
+                )}
+              </footer>
+            )}
+          </div>
+        </div>
+      )}
 
       {toast && <div className="toast">{toast}</div>}
     </main>

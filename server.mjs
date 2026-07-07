@@ -109,20 +109,72 @@ function cleanClock(value) {
   return /^\d{2}:\d{2}$/.test(value) ? value : undefined;
 }
 
+function cleanStayMinutes(value, fallback = 5) {
+  const minutes = Math.round(Number(value));
+  if (!Number.isFinite(minutes)) return fallback;
+  return Math.max(0, Math.min(720, minutes));
+}
+
+function parseClockMinutes(value) {
+  const clock = cleanClock(value) || "09:00";
+  const [hour, minute] = clock.split(":").map(Number);
+  return hour * 60 + minute;
+}
+
+function formatClockMinutes(totalMinutes) {
+  const normalized = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function derivedFixedWindowEndClock(windowStart, stayMinutes) {
+  const start = cleanClock(windowStart);
+  return start ? formatClockMinutes(parseClockMinutes(start) + stayMinutes) : undefined;
+}
+
+function isAnitabiStopLike(value) {
+  return Boolean(
+    value?.anitabiPointId ||
+    value?.workTitle ||
+    (typeof value?.source === "string" && value.source.startsWith("Anitabi"))
+  );
+}
+
 function normalizeStoredStop(value) {
   const lat = Number(value?.location?.lat);
   const lng = Number(value?.location?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const role = value?.role === "fixed" || value?.role === "end" ? value.role : "normal";
+  const legacyEnd = value?.role === "end";
+  const isStart = Boolean(value?.isStart);
+  const rawRole = value?.role;
+  const role =
+    rawRole === "fixed" || rawRole === "pilgrimage"
+      ? rawRole
+      : rawRole === "special"
+        ? "pilgrimage"
+        : isAnitabiStopLike(value)
+          ? "pilgrimage"
+          : "normal";
+  const isEnd = (Boolean(value?.isEnd) || legacyEnd) && !isStart;
+  const stayMinutes = cleanStayMinutes(value?.stayMinutes, isEnd ? 0 : 5);
+  const windowStart = role === "fixed"
+    ? cleanClock(value?.windowStart) || "12:00"
+    : isStart
+      ? cleanClock(value?.windowStart)
+      : undefined;
+  const windowEnd = role === "fixed" ? derivedFixedWindowEndClock(windowStart, stayMinutes) : undefined;
   return {
     ...value,
     id: cleanText(value?.id, randomUUID(), 120),
     name: cleanText(value?.name, "未命名地点", 180),
     location: { lat, lng },
     role,
-    windowStart: role === "fixed" ? cleanClock(value?.windowStart) : undefined,
-    windowEnd: role === "fixed" ? cleanClock(value?.windowEnd) : undefined,
-    stayMinutes: role === "end" ? 0 : 5
+    isStart,
+    isEnd,
+    windowStart,
+    windowEnd,
+    stayMinutes
   };
 }
 
