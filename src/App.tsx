@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, MouseEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type MapProvider = "google" | "osm";
 type TransitTimePreference = "departure" | "arrival";
@@ -1328,6 +1328,25 @@ function buildRouteStopsForPlan(stops: Stop[]) {
   return routeStops;
 }
 
+function isValidRouteCoordinate(value: unknown): value is [number, number] {
+  if (!Array.isArray(value) || value.length < 2) return false;
+  const lat = Number(value[0]);
+  const lng = Number(value[1]);
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+function routePlanCoordinates(routePlan: RoutePlan | null | undefined): Array<[number, number]> {
+  return (routePlan?.coordinates || [])
+    .filter(isValidRouteCoordinate)
+    .map(([lat, lng]) => [Number(lat), Number(lng)] as [number, number]);
+}
+
+function routeStopCoordinates(stops: Stop[]): Array<[number, number]> {
+  return stops
+    .map((stop) => [stop.location.lat, stop.location.lng] as [number, number])
+    .filter(isValidRouteCoordinate);
+}
+
 function stopsFromRouteOrderForEditor(orderedStops: Stop[]) {
   if (orderedStops.length > 1 && orderedStops[0]?.id === orderedStops[orderedStops.length - 1]?.id) {
     return orderedStops.slice(0, -1);
@@ -1418,6 +1437,7 @@ export default function App() {
   const [planSyncMode, setPlanSyncMode] = useState<"server" | "local">("local");
   const [stops, setStops] = useState<Stop[]>([]);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
+  const [selectedMapFocusKey, setSelectedMapFocusKey] = useState(0);
   const [tripDate, setTripDate] = useState(todayInputValue);
   const [startTime, setStartTime] = useState("09:00");
   const departureStop = null as Stop | null;
@@ -1460,6 +1480,23 @@ export default function App() {
   const pendingActivePlanIdRef = useRef<string | null>(readStoredActivePlanId());
   const anitabiSearchRequestRef = useRef(0);
   const skipNextAnitabiAutoSearchRef = useRef(false);
+
+  const focusStopOnMap = useCallback((stopId: string) => {
+    setSelectedStopId(stopId);
+    setSelectedMapFocusKey((current) => current + 1);
+  }, []);
+
+  const handleStopCardClick = useCallback(
+    (event: MouseEvent<HTMLElement>, stopId: string) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, button, a")) {
+        setSelectedStopId(stopId);
+        return;
+      }
+      focusStopOnMap(stopId);
+    },
+    [focusStopOnMap]
+  );
 
   const persistPlanToServer = useCallback(
     async (plan: DayPlan) => {
@@ -2258,8 +2295,9 @@ export default function App() {
         markerContent.className = `stop-marker ${selected ? "is-selected" : ""} ${isStartStop(stop) ? "is-start" : ""} ${isPilgrimageStop(stop) ? "is-pilgrimage" : ""} ${isFixedStop(stop) ? "is-fixed" : ""} ${isEndpointStop(stop) ? "is-endpoint" : ""}`;
         markerContent.textContent = routeStopSequenceLabel(stop, index);
         markerContent.title = stop.name;
-        markerContent.addEventListener("click", () => {
-          setSelectedStopId(stop.id);
+        markerContent.addEventListener("click", (event) => {
+          event.stopPropagation();
+          focusStopOnMap(stop.id);
           if (stop.imageUrl || stop.thumbnailUrl) {
             setImageLightboxStop(stop);
           }
@@ -2332,7 +2370,7 @@ export default function App() {
       const marker = L.marker([stop.location.lat, stop.location.lng], { icon })
         .addTo(leafletMapRef.current!)
         .on("click", () => {
-          setSelectedStopId(stop.id);
+          focusStopOnMap(stop.id);
           if (stop.imageUrl || stop.thumbnailUrl) {
             setImageLightboxStop(stop);
           }
@@ -2357,7 +2395,7 @@ export default function App() {
       return marker;
     }));
     leafletMarkersRef.current = markers;
-  }, [activePlanId, mapProvider, mapReady, markerRefreshKey, selectedStopId, selectedStopSet, stops]);
+  }, [activePlanId, focusStopOnMap, mapProvider, mapReady, markerRefreshKey, selectedStopId, selectedStopSet, stops]);
 
   useEffect(() => {
     if (!activePlanId || !mapReady || !routeStops.length) return;
@@ -2384,11 +2422,18 @@ export default function App() {
         googlePolylineRef.current.setMap(null);
         googlePolylineRef.current = null;
       }
-      if (!routePlan?.encodedPolyline && !routePlan?.coordinates?.length) return;
+      if (!routePlan) return;
 
-      const path = routePlan.coordinates?.length
-        ? routePlan.coordinates.map(([lat, lng]) => ({ lat, lng }))
-        : google.maps.geometry.encoding.decodePath(routePlan.encodedPolyline || "");
+      const coordinates = routePlanCoordinates(routePlan);
+      let path: Array<google.maps.LatLng | google.maps.LatLngLiteral> = coordinates.map(([lat, lng]) => ({ lat, lng }));
+      if (path.length < 2 && routePlan.encodedPolyline) {
+        path = google.maps.geometry.encoding.decodePath(routePlan.encodedPolyline || "");
+      }
+      if (path.length < 2) {
+        path = routeStopCoordinates(routeStops).map(([lat, lng]) => ({ lat, lng }));
+      }
+      if (path.length < 2) return;
+
       const polyline = new google.maps.Polyline({
         path,
         map: googleMapRef.current,
@@ -2422,9 +2467,14 @@ export default function App() {
       leafletPolylineRef.current.remove();
       leafletPolylineRef.current = null;
     }
-    if (!routePlan?.coordinates?.length) return;
+    if (!routePlan) return;
 
-    const polyline = L.polyline(routePlan.coordinates, {
+    const path = routePlanCoordinates(routePlan);
+    const fallbackPath = routeStopCoordinates(routeStops);
+    const coordinates = path.length >= 2 ? path : fallbackPath;
+    if (coordinates.length < 2) return;
+
+    const polyline = L.polyline(coordinates, {
       color: "#167c80",
       opacity: 0.94,
       weight: 5
@@ -2434,6 +2484,37 @@ export default function App() {
     leafletMapRef.current.fitBounds(bounds, { padding: [80, 80] });
     leafletPolylineRef.current = polyline;
   }, [activePlanId, mapProvider, mapReady, routeBoundsKey, routePlan, routeStops]);
+
+  useEffect(() => {
+    if (!activePlanId || !mapReady || !selectedMapFocusKey || !selectedStopId) return;
+    const stop = stops.find((item) => item.id === selectedStopId);
+    if (!stop) return;
+
+    const targetZoom = 16;
+    if (mapProvider === "google") {
+      const map = googleMapRef.current;
+      if (!map) return;
+      const focusMap = () => {
+        map.panTo(stop.location);
+        const currentZoom = map.getZoom() || 0;
+        if (currentZoom < targetZoom) {
+          map.setZoom(targetZoom);
+        }
+      };
+      focusMap();
+      const focusTimeout = window.setTimeout(focusMap, 500);
+      return () => window.clearTimeout(focusTimeout);
+    }
+
+    const map = leafletMapRef.current;
+    if (!map) return;
+    const focusMap = () => {
+      map.setView([stop.location.lat, stop.location.lng], Math.max(map.getZoom(), targetZoom), { animate: true });
+    };
+    focusMap();
+    const focusTimeout = window.setTimeout(focusMap, 500);
+    return () => window.clearTimeout(focusTimeout);
+  }, [activePlanId, mapProvider, mapReady, selectedMapFocusKey, selectedStopId, stops]);
 
   const runNominatimSearch = useCallback(async (query: string) => {
     if (query.trim().length < 2) {
@@ -2527,7 +2608,9 @@ export default function App() {
 
         if (orderChanged) {
           setStops(nextPlanStops);
-          setSelectedStopId(nextPlanStops[0]?.id || null);
+          setSelectedStopId((current) =>
+            current && nextPlanStops.some((stop) => stop.id === current) ? current : null
+          );
           setSelectedStopIds([]);
         }
         const nextRoutePlan: RoutePlan = {
@@ -2568,7 +2651,7 @@ export default function App() {
         setRoutePlan(nextRoutePlan);
         setRoutePlanStale(false);
         const fallbackCount = route.strategy?.fallbackWalkingLegs || 0;
-        const lateFixedStops = buildScheduleItems(nextPlanStops, nextRoutePlan.legs, routeDepartureTime)
+        const lateFixedStops = buildScheduleItems(nextPlanStops, nextRoutePlan.legs, routeStartClock(nextPlanStops, startTime))
           .filter((item) => item.isLate)
           .map((item) => item.stop.name);
         const sortMessage = orderChanged
@@ -3304,7 +3387,7 @@ export default function App() {
                   onDragStart={(event) => handleDragStart(event, stop.id)}
                   onDragOver={(event) => event.preventDefault()}
                   onDrop={(event) => handleDrop(event, stop.id)}
-                  onClick={() => setSelectedStopId(stop.id)}
+                  onClick={(event) => handleStopCardClick(event, stop.id)}
                 >
                   <div className="drag-handle" title="拖动排序" aria-label="拖动排序">
                     <GripVertical size={16} />

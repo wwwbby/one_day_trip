@@ -340,18 +340,78 @@ function toNavitimeDateTime(timeIso, localDateTime) {
   return `${value.year}-${value.month}-${value.day}T${value.hour}:${value.minute}:${value.second}`;
 }
 
+function parseLocalDateTimeParts(localDateTime) {
+  if (typeof localDateTime !== "string") return null;
+  const match = localDateTime.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second = "00"] = match;
+  const parts = {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+    hour: Number(hour),
+    minute: Number(minute),
+    second: Number(second)
+  };
+  return Object.values(parts).every(Number.isFinite) ? parts : null;
+}
+
+function formatUtcPartsAsLocalDateTime(date) {
+  return [
+    `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`,
+    `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}:${String(date.getUTCSeconds()).padStart(2, "0")}`
+  ].join("T");
+}
+
 function addMillisecondsToLocalDateTime(localDateTime, milliseconds) {
   if (!localDateTime || !Number.isFinite(milliseconds)) return "";
-  const date = new Date(localDateTime);
-  if (Number.isNaN(date.getTime())) return "";
-  const shifted = new Date(date.getTime() + milliseconds);
-  const year = shifted.getFullYear();
-  const month = String(shifted.getMonth() + 1).padStart(2, "0");
-  const day = String(shifted.getDate()).padStart(2, "0");
-  const hour = String(shifted.getHours()).padStart(2, "0");
-  const minute = String(shifted.getMinutes()).padStart(2, "0");
-  const second = String(shifted.getSeconds()).padStart(2, "0");
-  return `${year}-${month}-${day}T${hour}:${minute}:${second}`;
+  const parts = parseLocalDateTimeParts(localDateTime);
+  if (!parts) return "";
+  const shifted = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) + milliseconds
+  );
+  return formatUtcPartsAsLocalDateTime(shifted);
+}
+
+function dateFromTokyoLocalDateTime(localDateTime) {
+  const parts = parseLocalDateTimeParts(localDateTime);
+  if (!parts) return null;
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour - 9, parts.minute, parts.second));
+}
+
+function routeDateFromTime(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const trimmed = value.trim();
+  const date = /(?:z|[+-]\d{2}:?\d{2})$/i.test(trimmed)
+    ? new Date(trimmed)
+    : dateFromTokyoLocalDateTime(trimmed);
+  return date && !Number.isNaN(date.getTime()) ? date : null;
+}
+
+function withDepartureTiming(leg, requestedStart) {
+  const providerEnd = routeDateFromTime(leg?.endTime);
+  const fallbackEnd = new Date(requestedStart.getTime() + Math.max(0, Number(leg?.durationSeconds) || 0) * 1000);
+  const effectiveEnd = providerEnd && providerEnd.getTime() >= requestedStart.getTime() ? providerEnd : fallbackEnd;
+  const durationSeconds = Math.max(0, Math.round((effectiveEnd.getTime() - requestedStart.getTime()) / 1000));
+  return {
+    ...leg,
+    durationSeconds,
+    startTime: requestedStart.toISOString(),
+    endTime: effectiveEnd.toISOString()
+  };
+}
+
+function withArrivalTiming(leg, requestedEnd) {
+  const providerStart = routeDateFromTime(leg?.startTime);
+  const fallbackStart = new Date(requestedEnd.getTime() - Math.max(0, Number(leg?.durationSeconds) || 0) * 1000);
+  const effectiveStart = providerStart && providerStart.getTime() <= requestedEnd.getTime() ? providerStart : fallbackStart;
+  const durationSeconds = Math.max(0, Math.round((requestedEnd.getTime() - effectiveStart.getTime()) / 1000));
+  return {
+    ...leg,
+    durationSeconds,
+    startTime: effectiveStart.toISOString(),
+    endTime: requestedEnd.toISOString()
+  };
 }
 
 function haversineMeters(a, b) {
@@ -1094,7 +1154,7 @@ app.post("/api/auto-route", async (req, res) => {
     return res.status(400).json({ error: "At least two stops are required." });
   }
 
-  const anchorTime = new Date(transitDateTime);
+  const anchorTime = dateFromTokyoLocalDateTime(transitLocalDateTime) || new Date(transitDateTime);
   if (Number.isNaN(anchorTime.getTime())) {
     return res.status(400).json({ error: "Invalid route date/time." });
   }
@@ -1237,27 +1297,18 @@ app.post("/api/auto-route", async (req, res) => {
     if (arriveBy) {
       let cursor = anchorTime;
       for (let index = stops.length - 2; index >= 0; index -= 1) {
-        const leg = await requestAutoPair(stops[index], stops[index + 1], cursor, true);
-        const startTime = new Date(cursor.getTime() - leg.durationSeconds * 1000);
-        routeLegs[index] = {
-          ...leg,
-          startTime: startTime.toISOString(),
-          endTime: cursor.toISOString()
-        };
+        const leg = withArrivalTiming(await requestAutoPair(stops[index], stops[index + 1], cursor, true), cursor);
+        const startTime = new Date(leg.startTime);
+        routeLegs[index] = leg;
         const stayMinutes = Number(stops[index]?.stayMinutes) || 0;
         cursor = new Date(startTime.getTime() - stayMinutes * 60 * 1000);
       }
     } else {
-      const firstStayMinutes = Number(stops[0]?.stayMinutes) || 0;
-      let cursor = new Date(anchorTime.getTime() + firstStayMinutes * 60 * 1000);
+      let cursor = anchorTime;
       for (let index = 0; index < stops.length - 1; index += 1) {
-        const leg = await requestAutoPair(stops[index], stops[index + 1], cursor, false);
-        const endTime = new Date(cursor.getTime() + leg.durationSeconds * 1000);
-        routeLegs[index] = {
-          ...leg,
-          startTime: cursor.toISOString(),
-          endTime: endTime.toISOString()
-        };
+        const leg = withDepartureTiming(await requestAutoPair(stops[index], stops[index + 1], cursor, false), cursor);
+        const endTime = new Date(leg.endTime);
+        routeLegs[index] = leg;
         const nextStayMinutes = Number(stops[index + 1]?.stayMinutes) || 0;
         cursor = new Date(endTime.getTime() + nextStayMinutes * 60 * 1000);
       }
