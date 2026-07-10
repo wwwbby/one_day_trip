@@ -379,6 +379,33 @@ function dateFromTokyoLocalDateTime(localDateTime) {
   return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour - 9, parts.minute, parts.second));
 }
 
+function routeLocalDateFromAnchor(transitLocalDateTime, anchorTime) {
+  const parts = parseLocalDateTimeParts(transitLocalDateTime);
+  if (parts) {
+    return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+  }
+
+  const localDateTime = toNavitimeDateTime(anchorTime.toISOString());
+  return localDateTime ? localDateTime.slice(0, 10) : "";
+}
+
+function fixedWindowStartDate(stop, routeLocalDate) {
+  if (stop?.role !== "fixed" || !routeLocalDate) return null;
+  const windowStart = cleanClock(stop?.windowStart);
+  if (!windowStart) return null;
+  return dateFromTokyoLocalDateTime(`${routeLocalDate}T${windowStart}:00`);
+}
+
+function departureDateAfterStopVisit(stop, arrivalDate, routeLocalDate) {
+  const fixedStart = fixedWindowStartDate(stop, routeLocalDate);
+  const visitStart =
+    fixedStart && fixedStart.getTime() > arrivalDate.getTime()
+      ? fixedStart
+      : arrivalDate;
+  const stayMinutes = Math.max(0, Number(stop?.stayMinutes) || 0);
+  return new Date(visitStart.getTime() + stayMinutes * 60 * 1000);
+}
+
 function routeDateFromTime(value) {
   if (typeof value !== "string" || !value.trim()) return null;
   const trimmed = value.trim();
@@ -593,6 +620,45 @@ function directWalkingEstimate(fromStop, toStop, fallbackReason = "步行服务�
   };
 }
 
+function withLegMetadata(leg, metadata) {
+  const alternatives = Array.isArray(leg.alternatives)
+    ? leg.alternatives.map((alternative) => ({
+        ...alternative,
+        ...metadata
+      }))
+    : undefined;
+  return {
+    ...leg,
+    ...metadata,
+    ...(alternatives ? { alternatives } : {})
+  };
+}
+
+function compactRouteLeg(leg, includeAlternatives = false) {
+  const output = {
+    distanceMeters: leg.distanceMeters,
+    durationSeconds: leg.durationSeconds,
+    coordinates: leg.coordinates,
+    summary: leg.summary,
+    mode: leg.mode,
+    preferredMode: leg.preferredMode,
+    fallbackReason: leg.fallbackReason,
+    directDistanceMeters: leg.directDistanceMeters,
+    transfers: leg.transfers,
+    fare: leg.fare,
+    steps: leg.steps,
+    startTime: leg.startTime,
+    endTime: leg.endTime,
+    provider: leg.provider,
+    alternativeIndex: leg.alternativeIndex,
+    selectedAlternativeIndex: leg.selectedAlternativeIndex
+  };
+  if (includeAlternatives && Array.isArray(leg.alternatives) && leg.alternatives.length > 1) {
+    output.alternatives = leg.alternatives.map((alternative) => compactRouteLeg(alternative, false));
+  }
+  return output;
+}
+
 async function requestGoogleDirectionsPair({
   apiKey,
   fromStop,
@@ -762,6 +828,7 @@ function normalizeNavitimeRoute(route, fromStop, toStop) {
     endTime: summaryMove.to_time,
     transfers: Number(summaryMove.transit_count) || 0,
     fare: summaryMove.reference_fare?.lowest_total_ic || summaryMove.fare?.unit_48 || summaryMove.fare?.unit_0,
+    provider: "navitime",
     steps: moveSegments.map(({ section, fromPoint, toPoint }) => {
       const link = section.transport?.links?.[0];
       return {
@@ -855,7 +922,7 @@ async function requestNavitimePair({
   url.searchParams.set("shape", "true");
   url.searchParams.set("datum", "wgs84");
   url.searchParams.set("coord_unit", "degree");
-  url.searchParams.set("limit", "1");
+  url.searchParams.set("limit", "5");
   url.searchParams.set("term", "1440");
   url.searchParams.set("order", "time_optimized");
 
@@ -882,15 +949,25 @@ async function requestNavitimePair({
     throw error;
   }
 
-  const route = payload?.items?.[0];
-  if (!route) {
+  const routes = Array.isArray(payload?.items)
+    ? payload.items.map((route, index) => ({
+        ...normalizeNavitimeRoute(route, fromStop, toStop),
+        alternativeIndex: index,
+        selectedAlternativeIndex: index
+      }))
+    : [];
+  if (!routes.length) {
     const error = new Error("NAVITIME did not return a public transport route.");
     error.status = 404;
     error.details = payload;
     throw error;
   }
 
-  return normalizeNavitimeRoute(route, fromStop, toStop);
+  return {
+    ...routes[0],
+    selectedAlternativeIndex: 0,
+    alternatives: routes
+  };
 }
 
 async function requestTransitousPair(fromStop, toStop, timeIso, arriveBy) {
@@ -1186,11 +1263,10 @@ app.post("/api/auto-route", async (req, res) => {
 
         if (transitLeg.mode === "TRANSIT") {
           usedNavitime = true;
-          return {
-            ...transitLeg,
+          return withLegMetadata(transitLeg, {
             preferredMode: "TRANSIT",
             directDistanceMeters: Math.round(directDistanceMeters)
-          };
+          });
         }
       } catch (error) {
         // NAVITIME may still fail for missing coverage, quota, or an unconfigured RapidAPI key.
@@ -1210,11 +1286,10 @@ app.post("/api/auto-route", async (req, res) => {
         });
 
         if (transitLeg.mode === "TRANSIT") {
-          return {
-            ...transitLeg,
+          return withLegMetadata(transitLeg, {
             preferredMode: "TRANSIT",
             directDistanceMeters: Math.round(directDistanceMeters)
-          };
+          });
         }
       } catch (error) {
         const fallbackReason =
@@ -1293,6 +1368,7 @@ app.post("/api/auto-route", async (req, res) => {
   try {
     const arriveBy = transitTimePreference === "arrival";
     const routeLegs = new Array(stops.length - 1);
+    const routeLocalDate = routeLocalDateFromAnchor(transitLocalDateTime, anchorTime);
 
     if (arriveBy) {
       let cursor = anchorTime;
@@ -1309,8 +1385,7 @@ app.post("/api/auto-route", async (req, res) => {
         const leg = withDepartureTiming(await requestAutoPair(stops[index], stops[index + 1], cursor, false), cursor);
         const endTime = new Date(leg.endTime);
         routeLegs[index] = leg;
-        const nextStayMinutes = Number(stops[index + 1]?.stayMinutes) || 0;
-        cursor = new Date(endTime.getTime() + nextStayMinutes * 60 * 1000);
+        cursor = departureDateAfterStopVisit(stops[index + 1], endTime, routeLocalDate);
       }
     }
 
@@ -1330,21 +1405,7 @@ app.post("/api/auto-route", async (req, res) => {
           distanceMeters,
           durationSeconds,
           coordinates,
-          legs: routeLegs.map((leg) => ({
-            distanceMeters: leg.distanceMeters,
-            durationSeconds: leg.durationSeconds,
-            coordinates: leg.coordinates,
-            summary: leg.summary,
-            mode: leg.mode,
-            preferredMode: leg.preferredMode,
-            fallbackReason: leg.fallbackReason,
-            directDistanceMeters: leg.directDistanceMeters,
-            transfers: leg.transfers,
-            fare: leg.fare,
-            steps: leg.steps,
-            startTime: leg.startTime,
-            endTime: leg.endTime
-          })),
+          legs: routeLegs.map((leg) => compactRouteLeg(leg, true)),
           provider: usedNavitime ? "navitime-auto" : useGoogle ? "google-auto" : "free-auto",
           strategy: {
             transitThresholdMeters: autoTransitThresholdMeters,
